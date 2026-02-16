@@ -1,8 +1,9 @@
 ---
-# Ansible Playbook: Weekly Proxmox VE Host Update
-# Keeps your Proxmox hosts fully patched and updated.
+# Ansible Playbook: Weekly Debian/Ubuntu/Proxmox Update
+# Works on any Debian-based system. Automatically detects Proxmox
+# and runs additional PVE-specific checks.
 
-- name: Weekly update Proxmox VE hosts
+- name: Weekly update Debian-based systems
   hosts: all
   become: true
   gather_facts: true
@@ -10,12 +11,25 @@
 
   vars:
     auto_reboot: true
-    reboot_timeout: 600
+    reboot_timeout: 300
     autoremove_packages: true
 
   tasks:
     # ──────────────────────────────────────────────
-    # 1. System Update
+    # 1. Detect Proxmox
+    # ──────────────────────────────────────────────
+
+    - name: Check if this is a Proxmox host
+      ansible.builtin.stat:
+        path: /usr/bin/pveversion
+      register: pve_check
+
+    - name: Set Proxmox fact
+      ansible.builtin.set_fact:
+        is_proxmox: "{{ pve_check.stat.exists }}"
+
+    # ──────────────────────────────────────────────
+    # 2. System Update
     # ──────────────────────────────────────────────
 
     - name: Update apt cache
@@ -39,7 +53,7 @@
       register: upgrade_result
 
     # ──────────────────────────────────────────────
-    # 2. Cleanup
+    # 3. Cleanup
     # ──────────────────────────────────────────────
 
     - name: Remove unused dependencies
@@ -53,7 +67,7 @@
         autoclean: true
 
     # ──────────────────────────────────────────────
-    # 3. Reboot Handling
+    # 4. Reboot Handling
     # ──────────────────────────────────────────────
 
     - name: Check if reboot is required
@@ -80,27 +94,15 @@
         - auto_reboot
         - reboot_required.stat.exists
 
-    - name: Wait for Proxmox API to be available after reboot
-      ansible.builtin.uri:
-        url: "https://{{ ansible_host }}:8006/api2/json/version"
-        validate_certs: false
-        status_code: 200
-      register: pve_api
-      retries: 30
-      delay: 10
-      until: pve_api.status == 200
-      when:
-        - auto_reboot
-        - reboot_required.stat.exists
-
     # ──────────────────────────────────────────────
-    # 4. Verification
+    # 5. Proxmox Verification (only on PVE hosts)
     # ──────────────────────────────────────────────
 
     - name: Get current PVE version
       ansible.builtin.command: pveversion
       register: pve_version
       changed_when: false
+      when: is_proxmox
 
     - name: Check Proxmox services status
       ansible.builtin.systemd:
@@ -110,13 +112,29 @@
         - pveproxy
         - pvestatd
         - pve-cluster
-      register: services_status
+      register: pve_services
+      when: is_proxmox
 
-    - name: Display final status
+    # ──────────────────────────────────────────────
+    # 6. Final Status
+    # ──────────────────────────────────────────────
+
+    - name: Display final status (Proxmox)
       ansible.builtin.debug:
         msg:
           - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "PVE Version: {{ pve_version.stdout }}"
           - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
           - "Reboot performed: {{ 'Yes' if (reboot_required.stat.exists and auto_reboot) else 'No' }}"
-          - "All services running: {{ services_status.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
+          - "All PVE services running: {{ pve_services.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
+      when: is_proxmox
+
+    - name: Display final status (Debian/Ubuntu)
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
+          - "Reboot performed: {{ 'Yes' if (reboot_required.stat.exists and auto_reboot) else 'No' }}"
+      when: not is_proxmox
