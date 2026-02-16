@@ -1,0 +1,201 @@
+---
+# Proxmox VM Creation Playbook
+# Creates a new VM from scratch and boots from an ISO image.
+#
+# Required extra-vars:
+#   proxmox_host      - Proxmox API host IP/hostname
+#   proxmox_user      - Proxmox API user (e.g. root@pam)
+#   proxmox_pass      - Proxmox API password
+#   vm_name           - Name for the new VM
+#   iso_image         - ISO file on Proxmox storage (e.g. local:iso/ubuntu-24.04-server.iso)
+#
+# Optional extra-vars (with defaults):
+#   proxmox_node      - Proxmox node name (default: proxmox)
+#   proxmox_port      - API port (default: 8006)
+#   vm_id             - VM ID, auto-assigned if omitted
+#   vm_cores          - CPU cores (default: 2)
+#   vm_sockets        - CPU sockets (default: 1)
+#   vm_cpu_type       - CPU type (default: host)
+#   vm_memory         - Memory in MB (default: 2048)
+#   vm_disk_size      - Boot disk size (default: 32G)
+#   vm_storage        - Storage for VM disk (default: local-lvm)
+#   vm_bridge         - Network bridge (default: vmbr0)
+#   vm_vlan           - VLAN tag, omitted if not set
+#   vm_net_model      - NIC model (default: virtio)
+#   vm_os_type        - OS type hint (default: l26 for Linux 2.6+)
+#   vm_bios           - BIOS type: seabios or ovmf (default: seabios)
+#   vm_machine        - Machine type (default: q35)
+#   vm_pool           - Resource pool, omitted if not set
+#   vm_start          - Start VM after creation (default: true)
+#   vm_onboot         - Start on Proxmox boot (default: true)
+#   vm_agent          - Enable QEMU agent (default: true)
+#   vm_scsihw         - SCSI controller (default: virtio-scsi-single)
+#
+# Example usage:
+#   ansible-playbook proxmox-create-vm.yaml \
+#     -e "proxmox_host=192.168.1.10" \
+#     -e "proxmox_user=root@pam" \
+#     -e "proxmox_pass=secret" \
+#     -e "vm_name=my-new-vm" \
+#     -e "iso_image=local:iso/ubuntu-24.04-live-server-amd64.iso" \
+#     -e "vm_cores=4" \
+#     -e "vm_memory=4096" \
+#     -e "vm_disk_size=64G"
+
+- name: Create VM from scratch on Proxmox
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # --- Proxmox connection ---
+    proxmox_node: proxmox
+    proxmox_port: 8006
+
+    # --- VM hardware ---
+    vm_cores: 2
+    vm_sockets: 1
+    vm_cpu_type: host
+    vm_memory: 2048
+    vm_disk_size: 32G
+    vm_storage: local-lvm
+    vm_scsihw: virtio-scsi-single
+
+    # --- Network ---
+    vm_bridge: vmbr0
+    vm_net_model: virtio
+
+    # --- OS / Boot ---
+    vm_os_type: l26
+    vm_bios: seabios
+    vm_machine: q35
+
+    # --- Behavior ---
+    vm_start: true
+    vm_onboot: true
+    vm_agent: true
+
+  tasks:
+    # ----------------------------------------------------------------
+    # Dependency checks
+    # ----------------------------------------------------------------
+    - name: Ensure proxmoxer Python library is installed
+      ansible.builtin.pip:
+        name:
+          - proxmoxer
+          - requests
+        state: present
+      become: true
+
+    # ----------------------------------------------------------------
+    # Validate required variables
+    # ----------------------------------------------------------------
+    - name: Validate required variables are defined
+      ansible.builtin.assert:
+        that:
+          - proxmox_host is defined and proxmox_host | length > 0
+          - proxmox_user is defined and proxmox_user | length > 0
+          - proxmox_pass is defined and proxmox_pass | length > 0
+          - vm_name is defined and vm_name | length > 0
+          - iso_image is defined and iso_image | length > 0
+        fail_msg: >
+          Missing required variables. Please provide:
+          proxmox_host, proxmox_user, proxmox_pass, vm_name, iso_image
+        success_msg: "All required variables are set."
+
+    # ----------------------------------------------------------------
+    # Build network string
+    # ----------------------------------------------------------------
+    - name: Build network configuration string
+      ansible.builtin.set_fact:
+        _net_config: "{{ vm_net_model }},bridge={{ vm_bridge }}{{ ',tag=' + (vm_vlan | string) if vm_vlan is defined else '' }}"
+
+    # ----------------------------------------------------------------
+    # Create the VM
+    # ----------------------------------------------------------------
+    - name: Create Proxmox VM
+      community.general.proxmox_kvm:
+        # Connection
+        api_host: "{{ proxmox_host }}"
+        api_port: "{{ proxmox_port }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_pass }}"
+        node: "{{ proxmox_node }}"
+
+        # VM identity
+        vmid: "{{ vm_id | default(omit) }}"
+        name: "{{ vm_name }}"
+        pool: "{{ vm_pool | default(omit) }}"
+
+        # CPU
+        cores: "{{ vm_cores }}"
+        sockets: "{{ vm_sockets }}"
+        cpu: "{{ vm_cpu_type }}"
+
+        # Memory
+        memory: "{{ vm_memory }}"
+
+        # BIOS / Machine
+        bios: "{{ vm_bios }}"
+        machine: "{{ vm_machine }}"
+        ostype: "{{ vm_os_type }}"
+
+        # Storage controller
+        scsihw: "{{ vm_scsihw }}"
+
+        # Boot disk
+        scsi:
+          scsi0: "{{ vm_storage }}:{{ vm_disk_size }}"
+
+        # ISO / CD-ROM
+        ide:
+          ide2: "{{ iso_image }},media=cdrom"
+
+        # Boot order — disc first, then hard disk
+        boot: "order=ide2;scsi0"
+
+        # Network
+        net:
+          net0: "{{ _net_config }}"
+
+        # QEMU guest agent
+        agent: "{{ '1' if vm_agent else '0' }}"
+
+        # Start on Proxmox boot
+        onboot: "{{ vm_onboot }}"
+
+        # State
+        state: present
+      register: created_vm
+
+    - name: Display created VM info
+      ansible.builtin.debug:
+        msg: >
+          VM '{{ vm_name }}' created successfully
+          (VMID: {{ created_vm.vmid | default('auto-assigned') }})
+          on node '{{ proxmox_node }}'.
+
+    # ----------------------------------------------------------------
+    # Optionally start the VM
+    # ----------------------------------------------------------------
+    - name: Wait before starting VM
+      ansible.builtin.pause:
+        seconds: 5
+      when: vm_start | bool
+
+    - name: Start the VM
+      community.general.proxmox_kvm:
+        api_host: "{{ proxmox_host }}"
+        api_port: "{{ proxmox_port }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_pass }}"
+        node: "{{ proxmox_node }}"
+        name: "{{ vm_name }}"
+        state: started
+      when: vm_start | bool
+
+    - name: VM startup confirmation
+      ansible.builtin.debug:
+        msg: >
+          VM '{{ vm_name }}' is now running.
+          Connect via Proxmox console to complete OS installation from ISO.
+      when: vm_start | bool
