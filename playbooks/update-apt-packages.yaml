@@ -31,8 +31,8 @@
 
     - name: Set Proxmox facts
       ansible.builtin.set_fact:
-        is_proxmox: "{{ pve_check.stat.exists }}"
-        is_pbs: "{{ pbs_check.stat.exists }}"
+        is_proxmox: "{{ pve_check.stat.exists | bool }}"
+        is_pbs: "{{ pbs_check.stat.exists | bool }}"
 
     # ──────────────────────────────────────────────
     # 2. System Update
@@ -44,13 +44,13 @@
         cache_valid_time: 0
 
     - name: Check for available upgrades
-      ansible.builtin.command: apt list --upgradable
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2
       register: available_upgrades
       changed_when: false
 
     - name: Display available upgrades
       ansible.builtin.debug:
-        msg: "{{ available_upgrades.stdout_lines[1:] | default(['No upgrades available']) }}"
+        msg: "{{ available_upgrades.stdout_lines | default(['No upgrades available']) }}"
 
     - name: Perform full system upgrade (dist-upgrade)
       ansible.builtin.apt:
