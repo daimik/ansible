@@ -4,14 +4,23 @@
   gather_facts: false
 
   tasks:
+    - name: Debug variables
+      ansible.builtin.debug:
+        msg: "ha_url={{ ha_url }} | token length={{ vault_ha_token | length }}"
+
     - name: Check HA API is reachable
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
         method: GET
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
         status_code: 200
       register: ha_api_check
+
+    - name: Debug API response
+      ansible.builtin.debug:
+        var: ha_api_check
 
     - name: Get current Core update status
       ansible.builtin.uri:
@@ -20,7 +29,12 @@
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
+        status_code: 200
       register: core_update
+
+    - name: Debug Core update response
+      ansible.builtin.debug:
+        var: core_update
 
     - name: Display Core version info
       ansible.builtin.debug:
