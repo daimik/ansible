@@ -3,12 +3,23 @@
 # Core and Supervisor don't reboot, OS does.
 # Each update waits for HA to be fully available before proceeding.
 # If any update fails, the playbook stops - no further updates are attempted.
+#
+# Required extra-vars (set in Semaphore Environment):
+#   ha_url         - Home Assistant URL (e.g. http://homeassistan.com)
+#   vault_ha_token - Home Assistant long-lived access token
+#   gotify_url     - Gotify server URL (e.g. http://gotify)
+#   gotify_token   - Gotify application token
 
 - name: Update Home Assistant
   hosts: homeassistant
   gather_facts: false
   serial: 1
   max_fail_percentage: 0
+
+  vars:
+    gotify_url: "{{ lookup('env', 'GOTIFY_URL') | default(gotify_url, true) }}"
+    gotify_token: "{{ lookup('env', 'GOTIFY_TOKEN') | default(gotify_token, true) }}"
+    gotify_priority: 5
 
   tasks:
     # -------------------------------------------------------
@@ -71,6 +82,27 @@
     - name: No updates available
       ansible.builtin.debug:
         msg: "All components are up to date. Nothing to do."
+      when: not any_update_available
+
+    # -------------------------------------------------------
+    # Notify: No updates available
+    # -------------------------------------------------------
+    - name: Send Gotify notification (no updates)
+      ansible.builtin.shell: |
+        cat <<'PAYLOAD' | curl -s -o /dev/null -w "%{http_code}" \
+          -X POST "{{ gotify_url }}message" \
+          -H "X-Gotify-Key: {{ gotify_token }}" \
+          -H "Content-Type: application/json" \
+          -d @-
+        {
+          "title": "✅ Home Assistant — Already up to date",
+          "message": "🏠 **Home Assistant**\n\n🟢 **Core:** {{ core_update.json.attributes.installed_version }}\n\n🟢 **Supervisor:** {{ supervisor_update.json.attributes.installed_version }}\n\n🟢 **OS:** {{ os_update.json.attributes.installed_version }}\n\n---\n\n✅ **All components are up to date**",
+          "priority": {{ gotify_priority }},
+          "extras": {"client::display": {"contentType": "text/markdown"}}
+        }
+        PAYLOAD
+      delegate_to: localhost
+      changed_when: false
       when: not any_update_available
 
     # -------------------------------------------------------
@@ -219,3 +251,24 @@
           Core:       {{ 'Updated to ' + core_update.json.attributes.latest_version if core_needs_update else 'Already up to date (' + core_update.json.attributes.installed_version + ')' }}
           Supervisor: {{ 'Updated to ' + supervisor_update.json.attributes.latest_version if supervisor_needs_update else 'Already up to date (' + supervisor_update.json.attributes.installed_version + ')' }}
           OS:         {{ 'Updated to ' + os_update.json.attributes.latest_version if os_needs_update else 'Already up to date (' + os_update.json.attributes.installed_version + ')' }}
+
+    # -------------------------------------------------------
+    # Phase 7: Gotify notification (updates were performed)
+    # -------------------------------------------------------
+    - name: Send Gotify notification (updates completed)
+      ansible.builtin.shell: |
+        cat <<'PAYLOAD' | curl -s -o /dev/null -w "%{http_code}" \
+          -X POST "{{ gotify_url }}message" \
+          -H "X-Gotify-Key: {{ gotify_token }}" \
+          -H "Content-Type: application/json" \
+          -d @-
+        {
+          "title": "🏠 Home Assistant — Updated successfully",
+          "message": "🏠 **Home Assistant**\n\n🔧 **Core:** {{ core_update.json.attributes.installed_version }} → {{ core_update.json.attributes.latest_version }} {{ '✅ Updated' if core_needs_update else '— No change' }}\n\n🔧 **Supervisor:** {{ supervisor_update.json.attributes.installed_version }} → {{ supervisor_update.json.attributes.latest_version }} {{ '✅ Updated' if supervisor_needs_update else '— No change' }}\n\n🔧 **OS:** {{ os_update.json.attributes.installed_version }} → {{ os_update.json.attributes.latest_version }} {{ '✅ Updated' if os_needs_update else '— No change' }}\n\n---\n\n{{ '🔄 **OS was updated — system rebooted**' if os_needs_update else '✅ **All updates applied — no reboot needed**' }}",
+          "priority": {{ 8 if os_needs_update else gotify_priority }},
+          "extras": {"client::display": {"contentType": "text/markdown"}}
+        }
+        PAYLOAD
+      delegate_to: localhost
+      changed_when: false
+      when: any_update_available
