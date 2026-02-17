@@ -1,9 +1,19 @@
 ---
+# Update order: Core -> Supervisor -> OS
+# Core and Supervisor don't reboot, OS does.
+# Each update waits for HA to be fully available before proceeding.
+# If any update fails, the playbook stops - no further updates are attempted.
+
 - name: Update Home Assistant
   hosts: homeassistant
   gather_facts: false
+  serial: 1
+  max_fail_percentage: 0
 
   tasks:
+    # -------------------------------------------------------
+    # Phase 1: Check current state of all components
+    # -------------------------------------------------------
     - name: Check HA API is reachable
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
@@ -13,7 +23,7 @@
         return_content: true
         status_code: 200
 
-    - name: Get current Core update status
+    - name: Get Core update status
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/states/update.home_assistant_core_update"
         method: GET
@@ -23,14 +33,7 @@
         status_code: 200
       register: core_update
 
-    - name: Display Core version info
-      ansible.builtin.debug:
-        msg: >
-          Core - Current: {{ core_update.json.attributes.installed_version }}
-          | Latest: {{ core_update.json.attributes.latest_version }}
-          | Update available: {{ core_update.json.state }}
-
-    - name: Get current Supervisor update status
+    - name: Get Supervisor update status
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/states/update.home_assistant_supervisor_update"
         method: GET
@@ -40,14 +43,7 @@
         status_code: 200
       register: supervisor_update
 
-    - name: Display Supervisor version info
-      ansible.builtin.debug:
-        msg: >
-          Supervisor - Current: {{ supervisor_update.json.attributes.installed_version }}
-          | Latest: {{ supervisor_update.json.attributes.latest_version }}
-          | Update available: {{ supervisor_update.json.state }}
-
-    - name: Get current OS update status
+    - name: Get OS update status
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/states/update.home_assistant_operating_system_update"
         method: GET
@@ -57,13 +53,29 @@
         status_code: 200
       register: os_update
 
-    - name: Display OS version info
-      ansible.builtin.debug:
-        msg: >
-          OS - Current: {{ os_update.json.attributes.installed_version }}
-          | Latest: {{ os_update.json.attributes.latest_version }}
-          | Update available: {{ os_update.json.state }}
+    - name: Set update flags
+      ansible.builtin.set_fact:
+        core_needs_update: "{{ core_update.json.state == 'on' }}"
+        supervisor_needs_update: "{{ supervisor_update.json.state == 'on' }}"
+        os_needs_update: "{{ os_update.json.state == 'on' }}"
+        any_update_available: "{{ core_update.json.state == 'on' or supervisor_update.json.state == 'on' or os_update.json.state == 'on' }}"
 
+    - name: Display version overview
+      ansible.builtin.debug:
+        msg: |
+          === Current Status ===
+          Core:       {{ core_update.json.attributes.installed_version }} -> {{ core_update.json.attributes.latest_version }} {{ '[UPDATE AVAILABLE]' if core_needs_update else '[OK]' }}
+          Supervisor: {{ supervisor_update.json.attributes.installed_version }} -> {{ supervisor_update.json.attributes.latest_version }} {{ '[UPDATE AVAILABLE]' if supervisor_needs_update else '[OK]' }}
+          OS:         {{ os_update.json.attributes.installed_version }} -> {{ os_update.json.attributes.latest_version }} {{ '[UPDATE AVAILABLE]' if os_needs_update else '[OK]' }}
+
+    - name: No updates available
+      ansible.builtin.debug:
+        msg: "All components are up to date. Nothing to do."
+      when: not any_update_available
+
+    # -------------------------------------------------------
+    # Phase 2: Backup (only if any update is available)
+    # -------------------------------------------------------
     - name: Create backup before updating
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/services/backup/create"
@@ -75,15 +87,17 @@
         body:
           title: "ansible-pre-update-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
         status_code: [200, 201]
-      when: core_update.json.state == "on" or supervisor_update.json.state == "on" or os_update.json.state == "on"
+      when: any_update_available
 
     - name: Wait for backup to complete
       ansible.builtin.pause:
         seconds: 120
-      when: core_update.json.state == "on" or supervisor_update.json.state == "on" or os_update.json.state == "on"
+      when: any_update_available
 
-    # Update Core
-    - name: Update Home Assistant Core
+    # -------------------------------------------------------
+    # Phase 3: Update Core (no reboot, but HA restarts)
+    # -------------------------------------------------------
+    - name: "Update Core: {{ core_update.json.attributes.installed_version }} -> {{ core_update.json.attributes.latest_version }}"
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/services/update/install"
         method: POST
@@ -95,23 +109,44 @@
           entity_id: "update.home_assistant_core_update"
         status_code: [200, 201]
         timeout: 300
-      when: core_update.json.state == "on"
+      when: core_needs_update
 
-    - name: Wait for HA to come back after Core update
+    - name: Wait for HA to restart after Core update
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
         method: GET
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         status_code: 200
-      register: ha_health
-      until: ha_health.status == 200
+      register: ha_health_core
+      until: ha_health_core.status == 200
       retries: 60
       delay: 10
-      when: core_update.json.state == "on"
+      when: core_needs_update
 
-    # Update Supervisor
-    - name: Update Home Assistant Supervisor
+    - name: Verify Core update completed
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/states/update.home_assistant_core_update"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
+        status_code: 200
+      register: core_verify
+      when: core_needs_update
+
+    - name: Confirm Core is updated
+      ansible.builtin.assert:
+        that:
+          - core_verify.json.attributes.installed_version == core_update.json.attributes.latest_version
+        fail_msg: "Core update failed! Installed: {{ core_verify.json.attributes.installed_version }}, Expected: {{ core_update.json.attributes.latest_version }}. Stopping."
+        success_msg: "Core successfully updated to {{ core_verify.json.attributes.installed_version }}"
+      when: core_needs_update
+
+    # -------------------------------------------------------
+    # Phase 4: Update Supervisor (no reboot)
+    # -------------------------------------------------------
+    - name: "Update Supervisor: {{ supervisor_update.json.attributes.installed_version }} -> {{ supervisor_update.json.attributes.latest_version }}"
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/services/update/install"
         method: POST
@@ -123,9 +158,9 @@
           entity_id: "update.home_assistant_supervisor_update"
         status_code: [200, 201]
         timeout: 300
-      when: supervisor_update.json.state == "on"
+      when: supervisor_needs_update
 
-    - name: Wait for HA to come back after Supervisor update
+    - name: Wait for HA after Supervisor update
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
         method: GET
@@ -136,10 +171,13 @@
       until: ha_health_sup.status == 200
       retries: 60
       delay: 10
-      when: supervisor_update.json.state == "on"
+      when: supervisor_needs_update
 
-    # Update OS
-    - name: Update Home Assistant OS
+    # -------------------------------------------------------
+    # Phase 5: Update OS (REBOOTS the machine!)
+    # This must always be LAST.
+    # -------------------------------------------------------
+    - name: "Update OS: {{ os_update.json.attributes.installed_version }} -> {{ os_update.json.attributes.latest_version }} (WILL REBOOT)"
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/services/update/install"
         method: POST
@@ -151,9 +189,14 @@
           entity_id: "update.home_assistant_operating_system_update"
         status_code: [200, 201]
         timeout: 300
-      when: os_update.json.state == "on"
+      when: os_needs_update
 
-    - name: Wait for HA to come back after OS update
+    - name: Wait for system to reboot after OS update (longer wait)
+      ansible.builtin.pause:
+        seconds: 60
+      when: os_needs_update
+
+    - name: Wait for HA to come back after OS reboot
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
         method: GET
@@ -163,14 +206,16 @@
       register: ha_health_os
       until: ha_health_os.status == 200
       retries: 90
-      delay: 10
-      when: os_update.json.state == "on"
+      delay: 15
+      when: os_needs_update
 
-    # Final summary
+    # -------------------------------------------------------
+    # Phase 6: Final summary
+    # -------------------------------------------------------
     - name: Update summary
       ansible.builtin.debug:
         msg: |
           === Update Summary ===
-          Core: {{ 'Updated' if core_update.json.state == 'on' else 'Already up to date' }}
-          Supervisor: {{ 'Updated' if supervisor_update.json.state == 'on' else 'Already up to date' }}
-          OS: {{ 'Updated' if os_update.json.state == 'on' else 'Already up to date' }}
+          Core:       {{ 'Updated to ' + core_update.json.attributes.latest_version if core_needs_update else 'Already up to date (' + core_update.json.attributes.installed_version + ')' }}
+          Supervisor: {{ 'Updated to ' + supervisor_update.json.attributes.latest_version if supervisor_needs_update else 'Already up to date (' + supervisor_update.json.attributes.installed_version + ')' }}
+          OS:         {{ 'Updated to ' + os_update.json.attributes.latest_version if os_needs_update else 'Already up to date (' + os_update.json.attributes.installed_version + ')' }}
