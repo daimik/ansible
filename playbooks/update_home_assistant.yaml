@@ -4,10 +4,6 @@
   gather_facts: false
 
   tasks:
-    - name: Debug variables
-      ansible.builtin.debug:
-        msg: "ha_url={{ ha_url }} | token length={{ vault_ha_token | length }}"
-
     - name: Check HA API is reachable
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/"
@@ -16,11 +12,6 @@
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
         status_code: 200
-      register: ha_api_check
-
-    - name: Debug API response
-      ansible.builtin.debug:
-        var: ha_api_check
 
     - name: Get current Core update status
       ansible.builtin.uri:
@@ -32,15 +23,11 @@
         status_code: 200
       register: core_update
 
-    - name: Debug Core update response
-      ansible.builtin.debug:
-        var: core_update
-
     - name: Display Core version info
       ansible.builtin.debug:
         msg: >
-          Current: {{ core_update.json.attributes.installed_version }}
-          | Latest: {{ core_update.json.attributes.latest_available_version }}
+          Core - Current: {{ core_update.json.attributes.installed_version }}
+          | Latest: {{ core_update.json.attributes.latest_version }}
           | Update available: {{ core_update.json.state }}
 
     - name: Get current Supervisor update status
@@ -50,13 +37,14 @@
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
+        status_code: 200
       register: supervisor_update
 
     - name: Display Supervisor version info
       ansible.builtin.debug:
         msg: >
-          Current: {{ supervisor_update.json.attributes.installed_version }}
-          | Latest: {{ supervisor_update.json.attributes.latest_available_version }}
+          Supervisor - Current: {{ supervisor_update.json.attributes.installed_version }}
+          | Latest: {{ supervisor_update.json.attributes.latest_version }}
           | Update available: {{ supervisor_update.json.state }}
 
     - name: Get current OS update status
@@ -66,13 +54,14 @@
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
+        status_code: 200
       register: os_update
 
     - name: Display OS version info
       ansible.builtin.debug:
         msg: >
-          Current: {{ os_update.json.attributes.installed_version }}
-          | Latest: {{ os_update.json.attributes.latest_available_version }}
+          OS - Current: {{ os_update.json.attributes.installed_version }}
+          | Latest: {{ os_update.json.attributes.latest_version }}
           | Update available: {{ os_update.json.state }}
 
     - name: Create backup before updating
@@ -107,7 +96,6 @@
         status_code: [200, 201]
         timeout: 300
       when: core_update.json.state == "on"
-      register: core_update_result
 
     - name: Wait for HA to come back after Core update
       ansible.builtin.uri:
