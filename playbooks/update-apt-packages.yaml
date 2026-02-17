@@ -3,10 +3,6 @@
 # Works on any Debian-based system. Automatically detects Proxmox VE
 # and Proxmox Backup Server, then runs additional checks accordingly.
 # Sends Gotify notifications with reboot status per host.
-#
-# Required extra-vars (set in Semaphore Environment):
-#   gotify_url    - Gotify server URL (e.g. http://8.8.8.8:8011/)
-#   gotify_token  - Gotify application token
 
 - name: Weekly update Debian-based systems
   hosts: all
@@ -154,34 +150,28 @@
     # 7. Gotify Notifications (sent from remote host)
     # ──────────────────────────────────────────────
 
-    - name: Build Gotify notification body
+    - name: Build Gotify notification metadata
       ansible.builtin.set_fact:
         _gotify_title: >-
-          {{ '⚠️ ' + inventory_hostname + ' — Reboot required'
+          {{ '⚠️ ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — Reboot required'
              if reboot_required.stat.exists
-             else '✅ ' + inventory_hostname + ' — Update completed' }}
+             else '✅ ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — Update completed' }}
         _gotify_priority: "{{ 8 if reboot_required.stat.exists else gotify_priority }}"
-        _gotify_message: >-
-          **Host:** {{ inventory_hostname }}\n
-          **IP:** {{ ansible_default_ipv4.address }}\n
-          **OS:** {{ ansible_distribution }} {{ ansible_distribution_version }}\n
-          {{ '**PVE:** ' + pve_version.stdout + '\\n' if is_proxmox | bool else '' }}
-          {{ '**PBS:** ' + pbs_version.stdout_lines[0] + '\\n' if is_pbs | bool else '' }}
-          **Packages upgraded:** {{ 'Yes' if upgrade_result.changed else 'No' }}\n
-          {{ '**⚠️ Reboot is required — please reboot manually**' if reboot_required.stat.exists else '**No reboot required**' }}
 
     - name: Send Gotify notification
       ansible.builtin.shell: |
-        curl -s -o /dev/null -w "%{http_code}" \
+        cat <<'PAYLOAD' | curl -s -o /dev/null -w "%{http_code}" \
           -X POST "{{ gotify_url }}message" \
           -H "X-Gotify-Key: {{ gotify_token }}" \
           -H "Content-Type: application/json" \
-          -d '{
-            "title": "{{ _gotify_title | trim }}",
-            "message": "{{ _gotify_message | trim }}",
-            "priority": {{ _gotify_priority }},
-            "extras": {"client::display": {"contentType": "text/markdown"}}
-          }'
+          -d @-
+        {
+          "title": "{{ _gotify_title | trim }}",
+          "message": "🖥️ **Host:** {{ ansible_hostname }}\n\n🌐 **IP:** {{ ansible_default_ipv4.address }}\n\n🏷️ **FQDN:** {{ ansible_fqdn }}\n\n💻 **OS:** {{ ansible_distribution }} {{ ansible_distribution_version }}\n\n{{ '🟢 **PVE:** ' + pve_version.stdout + '\n\n' if is_proxmox | bool else '' }}{{ '🟢 **PBS:** ' + pbs_version.stdout_lines[0] + '\n\n' if is_pbs | bool else '' }}📦 **Packages upgraded:** {{ 'Yes' if upgrade_result.changed else 'No' }}\n\n---\n\n{{ '⚠️ **Reboot is required — please reboot manually!**' if reboot_required.stat.exists else '✅ **No reboot required**' }}",
+          "priority": {{ _gotify_priority }},
+          "extras": {"client::display": {"contentType": "text/markdown"}}
+        }
+        PAYLOAD
       register: gotify_response
       changed_when: false
       failed_when: gotify_response.stdout != "200"
