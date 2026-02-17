@@ -197,9 +197,14 @@
           '⚠️ **Reboot is required — please reboot manually!**' if reboot_required.stat.exists
           else '✅ **No reboot required**' }}
 
+    - name: Ensure curl is installed
+      ansible.builtin.apt:
+        name: curl
+        state: present
+
     - name: Send Gotify notification
       ansible.builtin.shell: |
-        cat <<'PAYLOAD' | curl -s -o /dev/null -w "%{http_code}" \
+        cat <<'PAYLOAD' | curl -s -m 15 -o /dev/null -w "%{http_code}" \
           -X POST "{{ gotify_url }}message" \
           -H "X-Gotify-Key: {{ gotify_token }}" \
           -H "Content-Type: application/json" \
@@ -211,9 +216,6 @@
           "extras": {"client::display": {"contentType": "text/markdown"}}
         }
         PAYLOAD
-      delegate_to: 127.0.0.1
-      connection: local
-      become: false
       register: gotify_response
       changed_when: false
       failed_when: gotify_response.stdout != "200"
