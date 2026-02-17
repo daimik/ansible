@@ -2,6 +2,10 @@
 # Ansible Playbook: Weekly Debian/Ubuntu/Proxmox Update
 # Works on any Debian-based system. Automatically detects Proxmox VE
 # and Proxmox Backup Server, then runs additional checks accordingly.
+#
+# Required extra-vars (set in Semaphore Environment):
+#   gotify_url    - Gotify server URL (e.g. http://10.10.4.75:8011/)
+#   gotify_token  - Gotify application token
 
 - name: Weekly update Debian-based systems
   hosts: all
@@ -10,9 +14,10 @@
   serial: 1
 
   vars:
-    auto_reboot: true
-    reboot_timeout: 300
     autoremove_packages: true
+    gotify_url: "{{ lookup('env', 'GOTIFY_URL') | default(gotify_url, true) }}"
+    gotify_token: "{{ lookup('env', 'GOTIFY_TOKEN') | default(gotify_token, true) }}"
+    gotify_priority: 5
 
   tasks:
     # ──────────────────────────────────────────────
@@ -57,6 +62,8 @@
         upgrade: dist
         dpkg_options: "force-confdef,force-confold"
       register: upgrade_result
+      async: 900
+      poll: 30
 
     # ──────────────────────────────────────────────
     # 3. Cleanup
@@ -74,7 +81,7 @@
       changed_when: autoclean_result.stdout is search('Del ')
 
     # ──────────────────────────────────────────────
-    # 4. Reboot Handling
+    # 4. Reboot Check
     # ──────────────────────────────────────────────
 
     - name: Check if reboot is required
@@ -86,20 +93,10 @@
       ansible.builtin.debug:
         msg: >-
           {% if reboot_required.stat.exists %}
-          REBOOT REQUIRED (likely kernel update)
+          REBOOT REQUIRED (likely kernel update) — manual reboot needed
           {% else %}
           No reboot required
           {% endif %}
-
-    - name: Reboot host if required
-      ansible.builtin.reboot:
-        msg: "Ansible: Rebooting after updates"
-        pre_reboot_delay: 15
-        post_reboot_delay: 30
-        reboot_timeout: "{{ reboot_timeout }}"
-      when:
-        - auto_reboot
-        - reboot_required.stat.exists
 
     # ──────────────────────────────────────────────
     # 5. Proxmox VE Verification (only on PVE hosts)
@@ -153,7 +150,71 @@
       when: is_pbs
 
     # ──────────────────────────────────────────────
-    # 7. Final Status
+    # 7. Gotify Notifications
+    # ──────────────────────────────────────────────
+
+    - name: Send Gotify notification (reboot needed)
+      ansible.builtin.uri:
+        url: "{{ gotify_url }}message"
+        method: POST
+        headers:
+          X-Gotify-Key: "{{ gotify_token }}"
+        body_format: json
+        body:
+          title: "⚠️ {{ inventory_hostname }} — Reboot required"
+          message: >-
+            **Host:** {{ inventory_hostname }}
+
+            **IP:** {{ ansible_default_ipv4.address }}
+
+            **OS:** {{ ansible_distribution }} {{ ansible_distribution_version }}
+            {{ '**PVE:** ' + pve_version.stdout if is_proxmox else '' }}
+            {{ '**PBS:** ' + pbs_version.stdout_lines[0] if is_pbs else '' }}
+
+            **Packages upgraded:** {{ 'Yes' if upgrade_result.changed else 'No' }}
+
+            **⚠️ Reboot is required — please reboot manually**
+          priority: 8
+          extras:
+            client::display:
+              contentType: "text/markdown"
+        status_code: 200
+      delegate_to: localhost
+      become: false
+      when: reboot_required.stat.exists
+
+    - name: Send Gotify notification (no reboot needed)
+      ansible.builtin.uri:
+        url: "{{ gotify_url }}message"
+        method: POST
+        headers:
+          X-Gotify-Key: "{{ gotify_token }}"
+        body_format: json
+        body:
+          title: "✅ {{ inventory_hostname }} — Update completed"
+          message: >-
+            **Host:** {{ inventory_hostname }}
+
+            **IP:** {{ ansible_default_ipv4.address }}
+
+            **OS:** {{ ansible_distribution }} {{ ansible_distribution_version }}
+            {{ '**PVE:** ' + pve_version.stdout if is_proxmox else '' }}
+            {{ '**PBS:** ' + pbs_version.stdout_lines[0] if is_pbs else '' }}
+
+            **Packages upgraded:** {{ 'Yes' if upgrade_result.changed else 'No' }}
+
+            **No reboot required**
+          priority: "{{ gotify_priority }}"
+          extras:
+            client::display:
+              contentType: "text/markdown"
+        status_code: 200
+      delegate_to: localhost
+      become: false
+      when: not reboot_required.stat.exists
+
+    # ──────────────────────────────────────────────
+    # 8. Final Status
     # ──────────────────────────────────────────────
 
     - name: Display final status (Proxmox VE)
@@ -163,7 +224,7 @@
           - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "PVE Version: {{ pve_version.stdout }}"
           - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
-          - "Reboot performed: {{ 'Yes' if (reboot_required.stat.exists and auto_reboot) else 'No' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
           - "All PVE services running: {{ pve_services.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
       when: is_proxmox
 
@@ -174,7 +235,7 @@
           - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "PBS Version: {{ pbs_version.stdout_lines[0] }}"
           - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
-          - "Reboot performed: {{ 'Yes' if (reboot_required.stat.exists and auto_reboot) else 'No' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
           - "All PBS services running: {{ pbs_services.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
           - "Datastores: {{ (pbs_datastores.stdout | from_json) | map(attribute='name') | list | join(', ') }}"
       when: is_pbs
@@ -185,5 +246,5 @@
           - "Host: {{ inventory_hostname }}"
           - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
-          - "Reboot performed: {{ 'Yes' if (reboot_required.stat.exists and auto_reboot) else 'No' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
       when: not is_proxmox and not is_pbs
