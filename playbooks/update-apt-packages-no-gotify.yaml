@@ -1,0 +1,201 @@
+---
+# Ansible Playbook: Weekly Debian/Ubuntu/Pop!_OS/Proxmox Update
+# Works on any apt-based system. Automatically detects Proxmox VE
+# and Proxmox Backup Server, then runs additional checks accordingly.
+#
+# Supported: Debian, Ubuntu, Pop!_OS, Proxmox VE, Proxmox Backup Server
+
+- name: Weekly update apt-based systems
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    autoremove_packages: true
+
+  tasks:
+    # ──────────────────────────────────────────────
+    # 1. Validate and detect system type
+    # ──────────────────────────────────────────────
+
+    - name: Verify this is an apt-based system
+      ansible.builtin.assert:
+        that:
+          - ansible_pkg_mgr == 'apt'
+        fail_msg: "This playbook only supports apt-based systems. Detected: {{ ansible_pkg_mgr }}"
+        success_msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} — apt confirmed"
+
+    - name: Check if this is a Proxmox VE host
+      ansible.builtin.stat:
+        path: /usr/bin/pveversion
+      register: pve_check
+
+    - name: Check if this is a Proxmox Backup Server
+      ansible.builtin.stat:
+        path: /usr/bin/proxmox-backup-manager
+      register: pbs_check
+
+    - name: Set system type facts
+      ansible.builtin.set_fact:
+        is_proxmox: "{{ pve_check.stat.exists | bool }}"
+        is_pbs: "{{ pbs_check.stat.exists | bool }}"
+        is_pop_os: "{{ ansible_distribution == 'Pop!_OS' }}"
+
+    # ──────────────────────────────────────────────
+    # 2. System Update
+    # ──────────────────────────────────────────────
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Check for available upgrades
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2
+      register: available_upgrades
+      changed_when: false
+
+    - name: Display available upgrades
+      ansible.builtin.debug:
+        msg: "{{ available_upgrades.stdout_lines | default(['No upgrades available']) }}"
+
+    - name: Perform full system upgrade (dist-upgrade)
+      ansible.builtin.apt:
+        upgrade: dist
+        dpkg_options: "force-confdef,force-confold"
+      register: upgrade_result
+      async: 900
+      poll: 30
+
+    # ──────────────────────────────────────────────
+    # 3. Cleanup
+    # ──────────────────────────────────────────────
+
+    - name: Remove unused dependencies
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      when: autoremove_packages
+
+    - name: Clean apt cache
+      ansible.builtin.command: apt-get autoclean -y
+      register: autoclean_result
+      changed_when: autoclean_result.stdout is search('Del ')
+
+    # ──────────────────────────────────────────────
+    # 4. Pop!_OS specific (flatpak updates)
+    # ──────────────────────────────────────────────
+
+    - name: Update Flatpak packages
+      ansible.builtin.command: flatpak update -y --noninteractive
+      register: flatpak_result
+      changed_when: flatpak_result.stdout is search('updating')
+      failed_when: false
+      when: is_pop_os
+
+    # ──────────────────────────────────────────────
+    # 5. Reboot Check
+    # ──────────────────────────────────────────────
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Display reboot status
+      ansible.builtin.debug:
+        msg: >-
+          {% if reboot_required.stat.exists %}
+          REBOOT REQUIRED (likely kernel update) — manual reboot needed
+          {% else %}
+          No reboot required
+          {% endif %}
+
+    # ──────────────────────────────────────────────
+    # 6. Proxmox VE Verification
+    # ──────────────────────────────────────────────
+
+    - name: Proxmox VE checks
+      when: is_proxmox
+      block:
+        - name: Get current PVE version
+          ansible.builtin.command: pveversion
+          register: pve_version
+          changed_when: false
+
+        - name: Check Proxmox VE services status
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+          loop:
+            - pvedaemon
+            - pveproxy
+            - pvestatd
+            - pve-cluster
+          register: pve_services
+
+    # ──────────────────────────────────────────────
+    # 7. Proxmox Backup Server Verification
+    # ──────────────────────────────────────────────
+
+    - name: Proxmox Backup Server checks
+      when: is_pbs
+      block:
+        - name: Get current PBS version
+          ansible.builtin.command: proxmox-backup-manager versions
+          register: pbs_version
+          changed_when: false
+
+        - name: Check Proxmox Backup Server services status
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+          loop:
+            - proxmox-backup
+            - proxmox-backup-proxy
+          register: pbs_services
+
+        - name: Check PBS datastore health
+          ansible.builtin.command: proxmox-backup-manager datastore list --output-format json
+          register: pbs_datastores
+          changed_when: false
+
+        - name: Display PBS datastore info
+          ansible.builtin.debug:
+            msg: "Datastores configured: {{ (pbs_datastores.stdout | from_json) | map(attribute='name') | list }}"
+
+    # ──────────────────────────────────────────────
+    # 8. Final Status
+    # ──────────────────────────────────────────────
+
+    - name: Display final status (Proxmox VE)
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ ansible_hostname }} ({{ inventory_hostname }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "PVE Version: {{ pve_version.stdout }}"
+          - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
+          - "All PVE services running: {{ pve_services.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
+      when: is_proxmox
+
+    - name: Display final status (Proxmox Backup Server)
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ ansible_hostname }} ({{ inventory_hostname }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "PBS Version: {{ pbs_version.stdout_lines[0] }}"
+          - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
+          - "All PBS services running: {{ pbs_services.results | map(attribute='status') | map(attribute='ActiveState') | list | unique == ['active'] }}"
+          - "Datastores: {{ (pbs_datastores.stdout | from_json) | map(attribute='name') | list | join(', ') }}"
+      when: is_pbs
+
+    - name: Display final status (Debian/Ubuntu/Pop!_OS)
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ ansible_hostname }} ({{ inventory_hostname }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Packages upgraded: {{ 'Yes' if upgrade_result.changed else 'No' }}"
+          - "{{ 'Flatpak updated: ' + ('Yes' if flatpak_result.changed else 'No') if is_pop_os | bool else '' }}"
+          - "Reboot required: {{ 'Yes' if reboot_required.stat.exists else 'No' }}"
+      when: not is_proxmox and not is_pbs
