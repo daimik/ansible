@@ -204,7 +204,7 @@
 
     - name: Send Gotify notification
       ansible.builtin.shell: |
-        cat <<'PAYLOAD' | curl -s -m 15 -o /dev/null -w "%{http_code}" \
+        cat <<'PAYLOAD' | curl -4 -s -m 30 --retry 2 --retry-delay 3 -o /dev/null -w "%{http_code}" \
           -X POST "{{ gotify_url }}message" \
           -H "X-Gotify-Key: {{ gotify_token }}" \
           -H "Content-Type: application/json" \
