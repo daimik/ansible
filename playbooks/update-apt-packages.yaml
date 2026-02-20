@@ -178,9 +178,9 @@
     - name: Build Gotify notification metadata
       ansible.builtin.set_fact:
         _gotify_title: >-
-          {{ '⚠️ ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — Reboot required'
+          {{ '⚠️ ' + ansible_hostname + ' — Reboot required'
              if reboot_required.stat.exists
-             else '✅ ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — Update completed' }}
+             else '✅ ' + ansible_hostname + ' — Update completed' }}
         _gotify_priority: "{{ 8 if reboot_required.stat.exists else gotify_priority }}"
 
     - name: Build Gotify message body
