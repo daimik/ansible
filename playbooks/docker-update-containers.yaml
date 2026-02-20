@@ -19,6 +19,9 @@
     gotify_token: "{{ lookup('env', 'GOTIFY_TOKEN') | default(gotify_token, true) }}"
     gotify_priority: 5
     prune_old_images: true
+    # Containers to skip (never update these)
+    exclude_containers:
+      - watchtower
 
   tasks:
     # ──────────────────────────────────────────────
@@ -26,43 +29,93 @@
     # ──────────────────────────────────────────────
 
     - name: Get all running containers
-      ansible.builtin.shell: >
-        docker ps --format '{{ '{{' }}.Names{{ '}}' }}' | sort
-      register: running_containers
+      ansible.builtin.command: docker ps --format "{% raw %}{{.Names}}{% endraw %}"
+      register: _containers_raw
       changed_when: false
+
+    - name: Build running containers list (excluding skipped)
+      ansible.builtin.set_fact:
+        _running_containers: "{{ _containers_raw.stdout_lines | difference(exclude_containers) | sort }}"
 
     - name: Display running containers
       ansible.builtin.debug:
-        msg: "Found {{ running_containers.stdout_lines | length }} running containers: {{ running_containers.stdout_lines | join(', ') }}"
+        msg: "Found {{ _running_containers | length }} running containers: {{ _running_containers | join(', ') }}"
 
     - name: Skip if no containers running
       ansible.builtin.meta: end_host
-      when: running_containers.stdout_lines | length == 0
+      when: _running_containers | length == 0
 
     # ──────────────────────────────────────────────
-    # 2. Get current image digests for comparison
+    # 2. Deploy update helper script
+    # ──────────────────────────────────────────────
+
+    - name: Create docker update helper script
+      ansible.builtin.copy:
+        dest: /tmp/docker-update-helper.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Usage: docker-update-helper.sh <action> <container_name>
+          ACTION="$1"
+          CONTAINER="$2"
+
+          case "$ACTION" in
+            get-image)
+              # Returns: container_name|image|image_digest
+              docker inspect --format '{{.Name}}|{{.Config.Image}}|{{.Image}}' "$CONTAINER" | sed 's|^/||'
+              ;;
+            get-image-id)
+              # Returns image ID for a given image name
+              IMAGE="$2"
+              docker inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null
+              ;;
+            get-run-config)
+              # Reconstructs docker run command from container inspection
+              docker inspect --format '
+              --name {{.Name}}
+              {{range .HostConfig.Binds}}-v {{.}} {{end}}
+              {{range $k, $v := .HostConfig.PortBindings}}{{range $v}}-p {{if .HostIP}}{{.HostIP}}:{{end}}{{.HostPort}}:{{$k}} {{end}}{{end}}
+              {{range .Config.Env}}-e "{{.}}" {{end}}
+              {{if .HostConfig.RestartPolicy.Name}}--restart {{.HostConfig.RestartPolicy.Name}}{{end}}
+              {{if .HostConfig.NetworkMode}}--network {{.HostConfig.NetworkMode}}{{end}}
+              {{if .Config.Hostname}}--hostname {{.Config.Hostname}}{{end}}
+              {{if .HostConfig.Privileged}}--privileged{{end}}
+              {{range .HostConfig.Devices}}--device {{.PathOnHost}}:{{.PathInContainer}} {{end}}
+              {{range .HostConfig.CapAdd}}--cap-add {{.}} {{end}}
+              {{if .HostConfig.PidMode}}--pid {{.HostConfig.PidMode}}{{end}}
+              {{range $k, $v := .Config.Labels}}-l "{{$k}}={{$v}}" {{end}}
+              -d {{.Config.Image}}
+              {{if .Config.Cmd}}{{range .Config.Cmd}}{{.}} {{end}}{{end}}
+              ' "$CONTAINER" | sed 's|--name /|--name |' | tr -s ' \n' ' ' | sed 's/^ *//;s/ *$//'
+              ;;
+            check-status)
+              docker ps --filter "name=^${CONTAINER}$" --format '{{.Status}}'
+              ;;
+          esac
+
+    # ──────────────────────────────────────────────
+    # 3. Get current image digests for comparison
     # ──────────────────────────────────────────────
 
     - name: Get current image info per container
-      ansible.builtin.shell: >
-        docker inspect --format '{{ '{{' }}.Name{{ '}}' }}|{{ '{{' }}.Config.Image{{ '}}' }}|{{ '{{' }}.Image{{ '}}' }}' {{ item }}
-      loop: "{{ running_containers.stdout_lines }}"
-      register: container_images
+      ansible.builtin.command: /tmp/docker-update-helper.sh get-image {{ item }}
+      loop: "{{ _running_containers }}"
+      register: _container_images
       changed_when: false
 
     - name: Build container image map
       ansible.builtin.set_fact:
         _container_map: >-
           {{ _container_map | default({}) | combine({
-            item.stdout.split('|')[0] | regex_replace('^/', ''): {
+            item.stdout.split('|')[0]: {
               'image': item.stdout.split('|')[1],
               'old_digest': item.stdout.split('|')[2]
             }
           }) }}
-      loop: "{{ container_images.results }}"
+      loop: "{{ _container_images.results }}"
 
     # ──────────────────────────────────────────────
-    # 3. Pull latest images
+    # 4. Pull latest images
     # ──────────────────────────────────────────────
 
     - name: Get unique images to pull
@@ -74,23 +127,19 @@
         msg: "Pulling {{ _unique_images | length }} unique images: {{ _unique_images | join(', ') }}"
 
     - name: Pull latest images
-      ansible.builtin.shell: "docker pull {{ item }}"
+      ansible.builtin.command: "docker pull {{ item }}"
       loop: "{{ _unique_images }}"
-      register: pull_results
-      changed_when: "'Downloaded newer image' in item_result.stdout | default('') or 'Pull complete' in item_result.stdout | default('')"
-      loop_control:
-        loop_var: item_result
-        label: "{{ item }}"
+      register: _pull_results
+      changed_when: "'Downloaded newer image' in item.stdout | default('') or 'Pull complete' in item.stdout | default('')"
 
     # ──────────────────────────────────────────────
-    # 4. Check which containers need updating
+    # 5. Check which containers need updating
     # ──────────────────────────────────────────────
 
-    - name: Get new image digests
-      ansible.builtin.shell: >
-        docker inspect --format '{{ '{{' }}.Id{{ '}}' }}' {{ item.value.image }}
+    - name: Get new image digests after pull
+      ansible.builtin.command: docker image inspect --format "{% raw %}{{.Id}}{% endraw %}" {{ item.value.image }}
       loop: "{{ _container_map | dict2items }}"
-      register: new_digests
+      register: _new_digests
       changed_when: false
 
     - name: Build update list
@@ -99,7 +148,7 @@
           {{ _containers_to_update | default([]) +
             ([item.item.key] if item.stdout != _container_map[item.item.key].old_digest else [])
           }}
-      loop: "{{ new_digests.results }}"
+      loop: "{{ _new_digests.results }}"
 
     - name: Set update list to empty if undefined
       ansible.builtin.set_fact:
@@ -109,73 +158,66 @@
       ansible.builtin.debug:
         msg: >-
           {{ _containers_to_update | length }} container(s) need updating:
-          {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None' }}
+          {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None — all images are latest' }}
 
     # ──────────────────────────────────────────────
-    # 5. Recreate containers with new images
+    # 6. Recreate containers with new images
     # ──────────────────────────────────────────────
 
     - name: Get full container run config
-      ansible.builtin.shell: |
-        docker inspect --format '
-        --name {{ item }}
-        {{ '{{' }} range .HostConfig.Binds {{ '}}' }}-v {{ '{{' }} . {{ '}}' }} {{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} range $k, $v := .HostConfig.PortBindings {{ '}}' }}{{ '{{' }} range $v {{ '}}' }}-p {{ '{{' }} .HostIP {{ '}}' }}:{{ '{{' }} .HostPort {{ '}}' }}:{{ '{{' }} $k {{ '}}' }} {{ '{{' }} end {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} range .Config.Env {{ '}}' }}-e {{ '{{' }} . {{ '}}' }} {{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} if .HostConfig.RestartPolicy.Name {{ '}}' }}--restart {{ '{{' }} .HostConfig.RestartPolicy.Name {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} if .HostConfig.NetworkMode {{ '}}' }}--network {{ '{{' }} .HostConfig.NetworkMode {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} if .Config.Hostname {{ '}}' }}--hostname {{ '{{' }} .Config.Hostname {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} if .HostConfig.Privileged {{ '}}' }}--privileged{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} range .HostConfig.Devices {{ '}}' }}--device {{ '{{' }} .PathOnHost {{ '}}' }}:{{ '{{' }} .PathInContainer {{ '}}' }} {{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} range .HostConfig.CapAdd {{ '}}' }}--cap-add {{ '{{' }} . {{ '}}' }} {{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} if .HostConfig.PidMode {{ '}}' }}--pid {{ '{{' }} .HostConfig.PidMode {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        {{ '{{' }} range $k, $v := .Config.Labels {{ '}}' }}-l {{ '{{' }} $k {{ '}}' }}={{ '{{' }} $v {{ '}}' }} {{ '{{' }} end {{ '}}' }}
-        -d {{ '{{' }} .Config.Image {{ '}}' }}
-        {{ '{{' }} if .Config.Cmd {{ '}}' }}{{ '{{' }} range .Config.Cmd {{ '}}' }}{{ '{{' }} . {{ '}}' }} {{ '{{' }} end {{ '}}' }}{{ '{{' }} end {{ '}}' }}
-        ' {{ item }} | tr -s ' \n' ' '
+      ansible.builtin.command: /tmp/docker-update-helper.sh get-run-config {{ item }}
       loop: "{{ _containers_to_update }}"
-      register: container_configs
+      register: _container_configs
       changed_when: false
       when: _containers_to_update | length > 0
 
-    - name: Stop and remove old container
-      ansible.builtin.shell: |
-        docker stop {{ item.item }} && docker rm {{ item.item }}
-      loop: "{{ container_configs.results | default([]) }}"
+    - name: Stop old container
+      ansible.builtin.command: docker stop {{ item.item }}
+      loop: "{{ _container_configs.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: _containers_to_update | length > 0
+
+    - name: Remove old container
+      ansible.builtin.command: docker rm {{ item.item }}
+      loop: "{{ _container_configs.results | default([]) }}"
       loop_control:
         label: "{{ item.item }}"
       when: _containers_to_update | length > 0
 
     - name: Recreate container with new image
-      ansible.builtin.shell: |
-        docker run {{ item.stdout | trim }}
-      loop: "{{ container_configs.results | default([]) }}"
+      ansible.builtin.shell: "docker run {{ item.stdout | trim }}"
+      loop: "{{ _container_configs.results | default([]) }}"
       loop_control:
         label: "{{ item.item }}"
-      register: recreate_results
+      register: _recreate_results
       when: _containers_to_update | length > 0
 
     - name: Verify containers are running
-      ansible.builtin.shell: >
-        docker ps --filter "name=^{{ item }}$" --format '{{ '{{' }}.Status{{ '}}' }}'
+      ansible.builtin.command: /tmp/docker-update-helper.sh check-status {{ item }}
       loop: "{{ _containers_to_update }}"
-      register: verify_results
-      failed_when: "'Up' not in verify_results.stdout"
+      register: _verify_results
+      failed_when: "'Up' not in _verify_results.stdout"
       changed_when: false
       when: _containers_to_update | length > 0
 
     # ──────────────────────────────────────────────
-    # 6. Cleanup old images
+    # 7. Cleanup
     # ──────────────────────────────────────────────
 
     - name: Prune dangling images
-      ansible.builtin.shell: docker image prune -f
-      register: prune_result
-      changed_when: "'Total reclaimed space: 0B' not in prune_result.stdout"
+      ansible.builtin.command: docker image prune -f
+      register: _prune_result
+      changed_when: "'Total reclaimed space: 0B' not in _prune_result.stdout"
       when: prune_old_images
 
+    - name: Remove helper script
+      ansible.builtin.file:
+        path: /tmp/docker-update-helper.sh
+        state: absent
+
     # ──────────────────────────────────────────────
-    # 7. Gotify Notification
+    # 8. Gotify Notification
     # ──────────────────────────────────────────────
 
     - name: Ensure curl is installed
@@ -197,7 +239,7 @@
         _gotify_message: >-
           🖥️ **Host:** {{ ansible_hostname }}\n\n🌐
           **IP:** {{ ansible_default_ipv4.address }}\n\n🐳
-          **Containers running:** {{ running_containers.stdout_lines | length }}\n\n📦
+          **Containers running:** {{ _running_containers | length }}\n\n📦
           **Updated:** {{ _containers_to_update | length }}\n\n{{
           '🔄 **Updated containers:**\n' + _containers_to_update | join(', ') + '\n\n'
           if _containers_to_update | length > 0
@@ -225,14 +267,16 @@
       failed_when: gotify_response.stdout != "200"
 
     # ──────────────────────────────────────────────
-    # 8. Final Status
+    # 9. Final Status
     # ──────────────────────────────────────────────
 
     - name: Display final status
       ansible.builtin.debug:
         msg:
           - "Host: {{ ansible_hostname }} ({{ inventory_hostname }})"
-          - "Total containers: {{ running_containers.stdout_lines | length }}"
+          - "Total containers: {{ _running_containers | length }}"
           - "Containers updated: {{ _containers_to_update | length }}"
           - "Updated: {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None' }}"
+          - "Excluded: {{ exclude_containers | join(', ') }}"
+          - "Images pruned: {{ 'Yes' if _prune_result.changed | default(false) else 'No' }}"
           - "Images pruned: {{ 'Yes' if prune_result.changed | default(false) else 'No' }}"
