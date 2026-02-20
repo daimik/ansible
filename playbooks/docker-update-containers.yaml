@@ -167,11 +167,23 @@
     # 7. Cleanup
     # ──────────────────────────────────────────────
 
-    - name: Prune dangling images
-      ansible.builtin.command: docker image prune -f
-      register: _prune_result
-      changed_when: "'Total reclaimed space: 0B' not in _prune_result.stdout"
+    - name: Docker cleanup
       when: prune_old_images
+      block:
+        - name: Prune dangling images
+          ansible.builtin.command: docker image prune -f
+          register: _prune_images
+          changed_when: "'Total reclaimed space: 0B' not in _prune_images.stdout"
+
+        - name: Prune unused volumes
+          ansible.builtin.command: docker volume prune -f
+          register: _prune_volumes
+          changed_when: "'Total reclaimed space: 0B' not in _prune_volumes.stdout"
+
+        - name: Prune unused networks
+          ansible.builtin.command: docker network prune -f
+          register: _prune_networks
+          changed_when: "'Deleted Networks' in _prune_networks.stdout"
 
     - name: Remove helper script
       ansible.builtin.file:
@@ -240,4 +252,6 @@
           - "Containers updated: {{ _containers_to_update | length }}"
           - "Updated: {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None' }}"
           - "Excluded: {{ exclude_containers | join(', ') }}"
-          - "Images pruned: {{ 'Yes' if _prune_result.changed | default(false) else 'No' }}"
+          - "Cleanup — Images pruned: {{ 'Yes' if _prune_images.changed | default(false) else 'No' }}"
+          - "Cleanup — Volumes pruned: {{ 'Yes' if _prune_volumes.changed | default(false) else 'No' }}"
+          - "Cleanup — Networks pruned: {{ 'Yes' if _prune_networks.changed | default(false) else 'No' }}"
