@@ -28,8 +28,8 @@
     # 1. Get list of all running containers
     # ──────────────────────────────────────────────
 
-    - name: Get all running containers
-      ansible.builtin.command: docker ps --format "{% raw %}{{.Names}}{% endraw %}"
+    - name: Get all running container names
+      ansible.builtin.shell: docker ps -a --filter "status=running" --format json | python3 -c "import sys,json; [print(json.loads(l)['Names']) for l in sys.stdin]"
       register: _containers_raw
       changed_when: false
 
@@ -137,7 +137,7 @@
     # ──────────────────────────────────────────────
 
     - name: Get new image digests after pull
-      ansible.builtin.command: docker image inspect --format "{% raw %}{{.Id}}{% endraw %}" {{ item.value.image }}
+      ansible.builtin.shell: "docker image inspect {{ item.value.image }} | python3 -c \"import sys,json; print(json.loads(sys.stdin.read())[0]['Id'])\""
       loop: "{{ _container_map | dict2items }}"
       register: _new_digests
       changed_when: false
@@ -279,4 +279,3 @@
           - "Updated: {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None' }}"
           - "Excluded: {{ exclude_containers | join(', ') }}"
           - "Images pruned: {{ 'Yes' if _prune_result.changed | default(false) else 'No' }}"
-          - "Images pruned: {{ 'Yes' if prune_result.changed | default(false) else 'No' }}"
