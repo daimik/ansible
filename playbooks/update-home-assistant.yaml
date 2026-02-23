@@ -188,7 +188,6 @@
 
     # -------------------------------------------------------
     # Phase 4: Update Supervisor (no reboot)
-    # Same connection-drop handling as Core.
     # -------------------------------------------------------
     - name: "Update Supervisor: {{ supervisor_update.json.attributes.installed_version }} -> {{ supervisor_update.json.attributes.latest_version }}"
       ansible.builtin.uri:
@@ -225,8 +224,6 @@
 
     # -------------------------------------------------------
     # Phase 5: Update OS (REBOOTS the machine!)
-    # This must always be LAST.
-    # Same connection-drop handling.
     # -------------------------------------------------------
     - name: "Update OS: {{ os_update.json.attributes.installed_version }} -> {{ os_update.json.attributes.latest_version }} (WILL REBOOT)"
       ansible.builtin.uri:
@@ -268,42 +265,104 @@
 
     # -------------------------------------------------------
     # Phase 6: Backup retention — keep only last N backups
+    # Uses POST /api/template to list backups (works with
+    # Bearer token), and hassio.backup_remove to delete.
     # -------------------------------------------------------
-    - name: Fetch backup list from Supervisor API
+    - name: Get backup list via template API
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/hassio/backups"
+        url: "{{ ha_url }}/api/template"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          template: >-
+            {{ '{{' }} state_attr('sensor.backup_manager', 'backups')
+            | default([], true)
+            | sort(attribute='date', reverse=true)
+            | map(attribute='slug')
+            | list
+            | tojson {{ '}}' }}
+        return_content: true
+        status_code: 200
+      register: backup_slugs_raw
+      ignore_errors: true
+
+    # Fallback: get backup info from the backup sensor state attributes
+    - name: Get backup info from sensor attributes
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/states/sensor.backup_manager"
         method: GET
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
-        status_code: 200
-      register: backup_list_raw
+        status_code: [200, 404]
+      register: backup_sensor
+      when: backup_slugs_raw is failed
+      ignore_errors: true
 
-    - name: Debug backup API response structure
+    # Fallback 2: list all sensor entities to find the right backup sensor
+    - name: Get backup state sensor
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/states/sensor.backup_state"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
+        status_code: [200, 404]
+      register: backup_state_sensor
+      when: backup_slugs_raw is failed
+      ignore_errors: true
+
+    # Fallback 3: Try hassio backups info endpoint (sometimes works)
+    - name: Try Supervisor backup list
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/hassio/backups/info"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
+        status_code: [200, 401]
+      register: backup_list_hassio
+      ignore_errors: true
+
+    - name: Debug - show what backup data we got
       ansible.builtin.debug:
         msg: |
-          === Backup API Response Debug ===
-          Top-level keys: {{ backup_list_raw.json.keys() | list }}
-          Has 'data' key: {{ 'data' in backup_list_raw.json }}
-          Has 'backups' key: {{ 'backups' in backup_list_raw.json }}
-          {% if 'data' in backup_list_raw.json %}
-          Data keys: {{ backup_list_raw.json.data.keys() | list if backup_list_raw.json.data is mapping else 'NOT A DICT' }}
+          === Backup Data Sources Debug ===
+          Template API success: {{ backup_slugs_raw is succeeded }}
+          {% if backup_slugs_raw is succeeded %}
+          Template result: {{ backup_slugs_raw.content[:500] | default('empty') }}
           {% endif %}
-          {% if 'data' in backup_list_raw.json and backup_list_raw.json.data is mapping and 'backups' in backup_list_raw.json.data %}
-          Backup count (data.backups): {{ backup_list_raw.json.data.backups | length }}
+          Backup manager sensor status: {{ backup_sensor.status | default('skipped') }}
+          {% if backup_sensor is defined and backup_sensor is succeeded and backup_sensor.status == 200 %}
+          Backup manager keys: {{ backup_sensor.json.attributes.keys() | list | default([]) }}
           {% endif %}
-          {% if 'backups' in backup_list_raw.json %}
-          Backup count (backups): {{ backup_list_raw.json.backups | length }}
+          Backup state sensor status: {{ backup_state_sensor.status | default('skipped') }}
+          {% if backup_state_sensor is defined and backup_state_sensor is succeeded and backup_state_sensor.status == 200 %}
+          Backup state keys: {{ backup_state_sensor.json.attributes.keys() | list | default([]) }}
           {% endif %}
-          Raw content (first 500 chars): {{ backup_list_raw.content[:500] }}
+          Hassio backups info status: {{ backup_list_hassio.status | default('skipped') }}
+          {% if backup_list_hassio is defined and backup_list_hassio is succeeded and backup_list_hassio.status == 200 %}
+          Hassio response keys: {{ backup_list_hassio.json.keys() | list | default([]) }}
+          Hassio content (first 500): {{ backup_list_hassio.content[:500] | default('empty') }}
+          {% endif %}
 
+    # Parse from whichever source worked
     - name: Parse backup list
       ansible.builtin.set_fact:
         all_backups: >-
-          {%- if backup_list_raw.json.data is defined and backup_list_raw.json.data is mapping and backup_list_raw.json.data.backups is defined -%}
-            {{ backup_list_raw.json.data.backups }}
-          {%- elif backup_list_raw.json.backups is defined -%}
-            {{ backup_list_raw.json.backups }}
+          {%- if backup_list_hassio is defined and backup_list_hassio is succeeded and backup_list_hassio.status == 200 -%}
+            {%- if backup_list_hassio.json.data is defined and backup_list_hassio.json.data.backups is defined -%}
+              {{ backup_list_hassio.json.data.backups }}
+            {%- elif backup_list_hassio.json.backups is defined -%}
+              {{ backup_list_hassio.json.backups }}
+            {%- else -%}
+              []
+            {%- endif -%}
+          {%- elif backup_sensor is defined and backup_sensor is succeeded and backup_sensor.status == 200 and backup_sensor.json.attributes.backups is defined -%}
+            {{ backup_sensor.json.attributes.backups }}
           {%- else -%}
             []
           {%- endif -%}
@@ -321,7 +380,7 @@
       ansible.builtin.debug:
         msg: |
           === Backup Retention ===
-          Total backups: {{ backups_sorted | length }}
+          Total backups found: {{ backups_sorted | length }}
           Keeping: {{ backups_kept_count }}
           Deleting: {{ backups_to_remove | length }}
           {% for b in backups_sorted[:backups_to_keep | int] %}
@@ -332,17 +391,22 @@
           {% endfor %}
           {{ '✅ No old backups to remove' if backups_to_remove | length == 0 else '' }}
 
-    - name: Delete old backups
+    - name: Delete old backups via hassio service
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/hassio/backups/{{ item.slug }}"
-        method: DELETE
+        url: "{{ ha_url }}/api/services/hassio/backup_remove"
+        method: POST
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
-        status_code: [200, 204]
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          slug: "{{ item.slug }}"
+        status_code: [200, 201]
       loop: "{{ backups_to_remove }}"
       loop_control:
         label: "{{ item.name | default(item.slug) }} ({{ item.date }})"
       when: backups_to_remove | length > 0
+      ignore_errors: true
 
     # -------------------------------------------------------
     # Phase 7: Final summary
