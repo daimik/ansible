@@ -10,7 +10,7 @@
 #   4. If NOTHING changed → skip everything, send "all up to date" notification
 #   5. Expand changed containers to full dependency groups
 #   6. Collect run configs for containers that need recreating
-#   7. Per group: fast stop(reverse) → rm → run(forward) — minimal downtime
+#   7. Per group: fast stop(reverse) → rm -f → verify gone → run(forward)
 #   8. Verify, cleanup, notify
 #
 # Required extra-vars (set in Semaphore Environment):
@@ -375,7 +375,7 @@
 
     # ──────────────────────────────────────────────
     # 8. Fast recreate per group (minimal downtime)
-    #    Stop reverse → rm → run forward
+    #    Stop reverse → rm -f → verify gone → run forward
     # ──────────────────────────────────────────────
 
     - name: Recreate containers (group-aware, minimal downtime)
@@ -390,6 +390,36 @@
 
         ok, fail = [], []
 
+        def run_cmd(cmd, shell=False):
+            """Run a command and return (success, stderr)."""
+            r = subprocess.run(cmd, shell=shell, capture_output=True, text=True)
+            return r.returncode == 0, r.stderr.strip()
+
+        def container_exists(name):
+            """Check if container exists (running or stopped)."""
+            r = subprocess.run(
+                ["docker", "ps", "-a", "--filter", "name=^{}$".format(name), "--format", "{{{{.Names}}}}"],
+                capture_output=True, text=True
+            )
+            return name in r.stdout.strip().split("\n")
+
+        def force_remove(name):
+            """Ensure container is fully removed. Returns True if gone."""
+            # Try stop first (graceful 10s timeout)
+            subprocess.run(["docker", "stop", "-t", "10", name],
+                           capture_output=True, text=True)
+            # Force remove (handles stopped, paused, dead states)
+            subprocess.run(["docker", "rm", "-f", name],
+                           capture_output=True, text=True)
+            # Verify it is actually gone
+            if container_exists(name):
+                # Last resort: kill then rm
+                subprocess.run(["docker", "kill", name],
+                               capture_output=True, text=True)
+                subprocess.run(["docker", "rm", "-f", name],
+                               capture_output=True, text=True)
+            return not container_exists(name)
+
         for group in affected:
             members = [c for c in g2c[group] if c in to_update]
             if not members:
@@ -400,48 +430,57 @@
             print("  {}: {}".format(group, " -> ".join(members)))
             print("=" * 60)
 
-            # Stop (reverse: dependents first)
+            # ── Stop & Remove (reverse order: dependents first) ──
+            all_removed = True
             for c in rev:
-                sys.stdout.write("  stop  {} ... ".format(c))
+                sys.stdout.write("  stop+rm {} ... ".format(c))
                 sys.stdout.flush()
-                r = subprocess.run(["docker", "stop", "-t", "10", c],
-                                   capture_output=True, text=True)
-                print("ok" if r.returncode == 0 else "WARN " + r.stderr.strip())
+                if force_remove(c):
+                    print("ok (gone)")
+                else:
+                    print("FAIL — container still exists!")
+                    all_removed = False
 
-            # Remove
-            for c in rev:
-                sys.stdout.write("  rm    {} ... ".format(c))
-                sys.stdout.flush()
-                r = subprocess.run(["docker", "rm", c],
-                                   capture_output=True, text=True)
-                print("ok" if r.returncode == 0 else "WARN " + r.stderr.strip())
+            if not all_removed:
+                print("  ERROR: could not remove all containers in group {}".format(group))
+                fail.extend(members)
+                continue
 
-            # Start (forward: dependencies first)
+            # ── Start (forward order: dependencies first) ──
             for c in members:
                 conf = cfg.get(c)
                 if not conf:
-                    print("  ERROR: no config for {}".format(c))
+                    print("  ERROR: no run config for {}".format(c))
                     fail.append(c)
                     continue
+
+                # Safety: ensure name is free before run
+                if container_exists(c):
+                    sys.stdout.write("  cleanup stale {} ... ".format(c))
+                    sys.stdout.flush()
+                    subprocess.run(["docker", "rm", "-f", c],
+                                   capture_output=True, text=True)
+                    print("ok")
+
                 sys.stdout.write("  run   {} ... ".format(c))
                 sys.stdout.flush()
-                r = subprocess.run("docker run " + conf, shell=True,
-                                   capture_output=True, text=True)
-                if r.returncode == 0:
+                success, err = run_cmd("docker run " + conf, shell=True)
+                if success:
                     print("ok")
                     ok.append(c)
                 else:
-                    print("FAIL " + r.stderr.strip())
+                    print("FAIL: {}".format(err))
                     fail.append(c)
 
             # Brief stabilization pause between groups
             if group != affected[-1]:
+                print("  ... waiting 5s between groups")
                 time.sleep(5)
 
         print("=" * 60)
         print("  Done: {} ok, {} failed".format(len(ok), len(fail)))
         if fail:
-            print("  Failed: {}".format(", ".join(fail)))
+            print("  FAILED: {}".format(", ".join(fail)))
             sys.exit(1)
         PYEOF
       register: _recreate
