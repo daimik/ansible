@@ -268,14 +268,6 @@
 
     # -------------------------------------------------------
     # Phase 6: Backup retention — keep only last N backups
-    # Uses the sensor attributes from the backup update entities
-    # to get backup info, and hassio.backup_remove to delete.
-    # Since /api/hassio/ proxy rejects Bearer tokens, we read
-    # the backup list via a template sensor or the HA event bus.
-    #
-    # Strategy: Call /api/services/hassio/backup_reload first,
-    # then fetch backup list via a GET to the Supervisor API
-    # using ansible.builtin.uri (same host, no delegation).
     # -------------------------------------------------------
     - name: Fetch backup list from Supervisor API
       ansible.builtin.uri:
@@ -284,29 +276,34 @@
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
         return_content: true
-        status_code: [200, 401]
-      register: backup_list_hassio
-      ignore_errors: true
-
-    - name: Try Core backup API as fallback
-      ansible.builtin.uri:
-        url: "{{ ha_url }}/api/backups"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ vault_ha_token }}"
-        return_content: true
         status_code: 200
-      register: backup_list_core
-      when: backup_list_hassio is failed or backup_list_hassio.status == 401
-      ignore_errors: true
+      register: backup_list_raw
+
+    - name: Debug backup API response structure
+      ansible.builtin.debug:
+        msg: |
+          === Backup API Response Debug ===
+          Top-level keys: {{ backup_list_raw.json.keys() | list }}
+          Has 'data' key: {{ 'data' in backup_list_raw.json }}
+          Has 'backups' key: {{ 'backups' in backup_list_raw.json }}
+          {% if 'data' in backup_list_raw.json %}
+          Data keys: {{ backup_list_raw.json.data.keys() | list if backup_list_raw.json.data is mapping else 'NOT A DICT' }}
+          {% endif %}
+          {% if 'data' in backup_list_raw.json and backup_list_raw.json.data is mapping and 'backups' in backup_list_raw.json.data %}
+          Backup count (data.backups): {{ backup_list_raw.json.data.backups | length }}
+          {% endif %}
+          {% if 'backups' in backup_list_raw.json %}
+          Backup count (backups): {{ backup_list_raw.json.backups | length }}
+          {% endif %}
+          Raw content (first 500 chars): {{ backup_list_raw.content[:500] }}
 
     - name: Parse backup list
       ansible.builtin.set_fact:
         all_backups: >-
-          {%- if backup_list_hassio is succeeded and backup_list_hassio.status == 200 -%}
-            {{ (backup_list_hassio.json.data.backups | default(backup_list_hassio.json.backups | default([]))) }}
-          {%- elif backup_list_core is defined and backup_list_core is succeeded -%}
-            {{ (backup_list_core.json.data.backups | default(backup_list_core.json.backups | default([]))) }}
+          {%- if backup_list_raw.json.data is defined and backup_list_raw.json.data is mapping and backup_list_raw.json.data.backups is defined -%}
+            {{ backup_list_raw.json.data.backups }}
+          {%- elif backup_list_raw.json.backups is defined -%}
+            {{ backup_list_raw.json.backups }}
           {%- else -%}
             []
           {%- endif -%}
@@ -335,8 +332,7 @@
           {% endfor %}
           {{ '✅ No old backups to remove' if backups_to_remove | length == 0 else '' }}
 
-    # Try Supervisor proxy first for delete, fall back to Core API
-    - name: Delete old backups via Supervisor API
+    - name: Delete old backups
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/hassio/backups/{{ item.slug }}"
         method: DELETE
@@ -346,24 +342,7 @@
       loop: "{{ backups_to_remove }}"
       loop_control:
         label: "{{ item.name | default(item.slug) }} ({{ item.date }})"
-      register: delete_hassio
-      ignore_errors: true
       when: backups_to_remove | length > 0
-
-    - name: Delete old backups via Core API (fallback)
-      ansible.builtin.uri:
-        url: "{{ ha_url }}/api/backups/{{ item.item.slug }}"
-        method: DELETE
-        headers:
-          Authorization: "Bearer {{ vault_ha_token }}"
-        status_code: [200, 204]
-      loop: "{{ delete_hassio.results | default([]) }}"
-      loop_control:
-        label: "{{ item.item.name | default(item.item.slug) | default('unknown') }}"
-      when:
-        - delete_hassio.results is defined
-        - item is failed
-      ignore_errors: true
 
     # -------------------------------------------------------
     # Phase 7: Final summary
@@ -375,7 +354,7 @@
           Core:       {{ 'Updated to ' + core_update.json.attributes.latest_version if core_needs_update else 'Already up to date (' + core_update.json.attributes.installed_version + ')' }}
           Supervisor: {{ 'Updated to ' + supervisor_update.json.attributes.latest_version if supervisor_needs_update else 'Already up to date (' + supervisor_update.json.attributes.installed_version + ')' }}
           OS:         {{ 'Updated to ' + os_update.json.attributes.latest_version if os_needs_update else 'Already up to date (' + os_update.json.attributes.installed_version + ')' }}
-          Backups:    {{ backups_to_remove | length }} old backup(s) targeted for removal, {{ backups_kept_count }} retained
+          Backups:    {{ backups_to_remove | length }} old backup(s) removed, {{ backups_kept_count }} retained
 
     # -------------------------------------------------------
     # Phase 8: Gotify notification (updates were performed)
