@@ -106,7 +106,7 @@
       when: not any_update_available
 
     # -------------------------------------------------------
-    # Phase 2: Backup via Supervisor API (only if any update)
+    # Phase 2: Backup via hassio service
     # -------------------------------------------------------
     - name: Create full backup before updating
       ansible.builtin.uri:
@@ -122,13 +122,15 @@
         timeout: 600
       when: any_update_available
 
-    - name: Display backup result
-      ansible.builtin.debug:
-        msg: "Backup created: {{ backup_result.json | default('unknown') }}"
+    - name: Wait for backup to complete
+      ansible.builtin.pause:
+        seconds: 120
       when: any_update_available
 
     # -------------------------------------------------------
     # Phase 3: Update Core (no reboot, but HA restarts)
+    # The update call may drop the connection when HA restarts
+    # itself, so we accept connection failures and verify after.
     # -------------------------------------------------------
     - name: "Update Core: {{ core_update.json.attributes.installed_version }} -> {{ core_update.json.attributes.latest_version }}"
       ansible.builtin.uri:
@@ -142,6 +144,12 @@
           entity_id: "update.home_assistant_core_update"
         status_code: [200, 201]
         timeout: 300
+      register: core_update_result
+      failed_when: >
+        core_update_result is failed
+        and 'Remote end closed connection' not in (core_update_result.msg | default(''))
+        and 'Connection failure' not in (core_update_result.msg | default(''))
+        and 'timed out' not in (core_update_result.msg | default(''))
       when: core_needs_update
 
     - name: Wait for HA to restart after Core update
@@ -178,6 +186,7 @@
 
     # -------------------------------------------------------
     # Phase 4: Update Supervisor (no reboot)
+    # Same connection-drop handling as Core.
     # -------------------------------------------------------
     - name: "Update Supervisor: {{ supervisor_update.json.attributes.installed_version }} -> {{ supervisor_update.json.attributes.latest_version }}"
       ansible.builtin.uri:
@@ -191,6 +200,12 @@
           entity_id: "update.home_assistant_supervisor_update"
         status_code: [200, 201]
         timeout: 300
+      register: supervisor_update_result
+      failed_when: >
+        supervisor_update_result is failed
+        and 'Remote end closed connection' not in (supervisor_update_result.msg | default(''))
+        and 'Connection failure' not in (supervisor_update_result.msg | default(''))
+        and 'timed out' not in (supervisor_update_result.msg | default(''))
       when: supervisor_needs_update
 
     - name: Wait for HA after Supervisor update
@@ -209,6 +224,7 @@
     # -------------------------------------------------------
     # Phase 5: Update OS (REBOOTS the machine!)
     # This must always be LAST.
+    # Same connection-drop handling.
     # -------------------------------------------------------
     - name: "Update OS: {{ os_update.json.attributes.installed_version }} -> {{ os_update.json.attributes.latest_version }} (WILL REBOOT)"
       ansible.builtin.uri:
@@ -222,6 +238,12 @@
           entity_id: "update.home_assistant_operating_system_update"
         status_code: [200, 201]
         timeout: 300
+      register: os_update_result
+      failed_when: >
+        os_update_result is failed
+        and 'Remote end closed connection' not in (os_update_result.msg | default(''))
+        and 'Connection failure' not in (os_update_result.msg | default(''))
+        and 'timed out' not in (os_update_result.msg | default(''))
       when: os_needs_update
 
     - name: Wait for system to reboot after OS update (longer wait)
