@@ -1,8 +1,17 @@
 ---
-# Ansible Playbook: Update all Docker containers
-# Pulls latest images for all running containers, recreates them
-# with the same configuration (ports, volumes, env, etc.)
-# Replaces Watchtower with a controlled, scheduled approach.
+# ════════════════════════════════════════════════════════════
+# Ansible Playbook: Update all Docker containers (Watchtower-style)
+# ════════════════════════════════════════════════════════════
+#
+# Logic (mirrors Watchtower):
+#   1. Discover all running containers and their current image digests
+#   2. Pull ALL latest images upfront (slow part — no downtime yet)
+#   3. Compare old vs new digests — build list of what actually changed
+#   4. If NOTHING changed → skip everything, send "all up to date" notification
+#   5. Expand changed containers to full dependency groups
+#   6. Collect run configs for containers that need recreating
+#   7. Per group: fast stop(reverse) → rm → run(forward) — minimal downtime
+#   8. Verify, cleanup, notify
 #
 # Required extra-vars (set in Semaphore Environment):
 #   gotify_url    - Gotify server URL (e.g. http://gotify/)
@@ -19,151 +28,435 @@
     gotify_token: "{{ lookup('env', 'GOTIFY_TOKEN') | default(gotify_token, true) }}"
     gotify_priority: 5
     prune_old_images: true
-    # Containers to skip (never update these)
+
+    # Never touch these containers
     exclude_containers:
       - ansible-semaphoreui-1
       - ansible-semaphoreui_db-1
 
+    # Dependency groups — if ANY member gets a new image, ALL are recreated.
+    # Order = start order (DB first, then app, then sidecar).
+    # Compose project groups are auto-detected from labels.
+    manual_groups:
+      zabbix-stack:
+        - zabbix-postgres
+        - zabbix-server
+        - zabbix-web
+        - zabbix-agent
+        - zabbix-snmptraps
+        - zabbix-smtp-gotify
+      speedtest-stack:
+        - speedtest-db
+        - speedtest-web
+      bookstack-stack:
+        - bookstack_db
+        - bookstack
+      traccar-stack:
+        - traccar
+        - traccar-smtp-gotify
+
   tasks:
     # ──────────────────────────────────────────────
-    # 1. Get list of all running containers
+    # 1. Discover running containers
     # ──────────────────────────────────────────────
 
     - name: Get all running container names
-      ansible.builtin.shell: docker ps -a --filter "status=running" --format json | python3 -c "import sys,json; [print(json.loads(l)['Names']) for l in sys.stdin]"
+      ansible.builtin.shell: >
+        docker ps --filter "status=running" --format '{{ '{{' }}.Names{{ '}}' }}'
       register: _containers_raw
       changed_when: false
 
-    - name: Build running containers list (excluding skipped)
+    - name: Build running containers list
       ansible.builtin.set_fact:
-        _running_containers: "{{ _containers_raw.stdout_lines | difference(exclude_containers) | sort }}"
+        _running: "{{ _containers_raw.stdout_lines | difference(exclude_containers) | sort }}"
 
     - name: Display running containers
       ansible.builtin.debug:
-        msg: "Found {{ _running_containers | length }} running containers: {{ _running_containers | join(', ') }}"
+        msg: "{{ _running | length }} running containers ({{ exclude_containers | length }} excluded)"
 
-    - name: Skip if no containers running
+    - name: End host if nothing running
       ansible.builtin.meta: end_host
-      when: _running_containers | length == 0
+      when: _running | length == 0
 
     # ──────────────────────────────────────────────
-    # 2. Deploy update helper script
+    # 2. Deploy helper script
     # ──────────────────────────────────────────────
 
-    - name: Create docker update helper script
-      ansible.builtin.shell: echo 'IyEvYmluL2Jhc2gKQUNUSU9OPSIkMSIKQ09OVEFJTkVSPSIkMiIKCmNhc2UgIiRBQ1RJT04iIGluCiAgZ2V0LWltYWdlKQogICAgZG9ja2VyIGluc3BlY3QgLS1mb3JtYXQgJ3t7Lk5hbWV9fXx7ey5Db25maWcuSW1hZ2V9fXx7ey5JbWFnZX19JyAiJENPTlRBSU5FUiIgfCBzZWQgJ3N8Xi98fCcKICAgIDs7CiAgZ2V0LXJ1bi1jb25maWcpCiAgICBkb2NrZXIgaW5zcGVjdCAiJENPTlRBSU5FUiIgfCBweXRob24zIDw8ICdQWUVPRicKaW1wb3J0IHN5cywganNvbgoKYyA9IGpzb24ubG9hZHMoc3lzLnN0ZGluLnJlYWQoKSlbMF0KYXJncyA9IFtdCgojIE5hbWUKbmFtZSA9IGNbJ05hbWUnXS5sc3RyaXAoJy8nKQphcmdzLmFwcGVuZCgnLS1uYW1lICcgKyBuYW1lKQoKIyBWb2x1bWVzL0JpbmRzCmZvciBiIGluIChjLmdldCgnSG9zdENvbmZpZycsIHt9KS5nZXQoJ0JpbmRzJykgb3IgW10pOgogICAgYXJncy5hcHBlbmQoJy12ICcgKyBiKQoKIyBQb3J0cwpwb3J0cyA9IGMuZ2V0KCdIb3N0Q29uZmlnJywge30pLmdldCgnUG9ydEJpbmRpbmdzJykgb3Ige30KZm9yIGNvbnRhaW5lcl9wb3J0LCBiaW5kaW5ncyBpbiBwb3J0cy5pdGVtcygpOgogICAgaWYgYmluZGluZ3M6CiAgICAgICAgZm9yIGJpbmQgaW4gYmluZGluZ3M6CiAgICAgICAgICAgIGhvc3RfaXAgPSBiaW5kLmdldCgnSG9zdElwJywgJycpCiAgICAgICAgICAgIGhvc3RfcG9ydCA9IGJpbmQuZ2V0KCdIb3N0UG9ydCcsICcnKQogICAgICAgICAgICBpZiBob3N0X2lwIGFuZCBob3N0X2lwIG5vdCBpbiAoJzAuMC4wLjAnLCAnOjonLCAnJyk6CiAgICAgICAgICAgICAgICBhcmdzLmFwcGVuZCgnLXAge306e306e30nLmZvcm1hdChob3N0X2lwLCBob3N0X3BvcnQsIGNvbnRhaW5lcl9wb3J0KSkKICAgICAgICAgICAgZWxpZiBob3N0X3BvcnQ6CiAgICAgICAgICAgICAgICBhcmdzLmFwcGVuZCgnLXAge306e30nLmZvcm1hdChob3N0X3BvcnQsIGNvbnRhaW5lcl9wb3J0KSkKCiMgRW52aXJvbm1lbnQgLSBza2lwIHN5c3RlbS9ydW50aW1lIHZhcnMKc2tpcF9wcmVmaXhlcyA9ICgKICAgICdQQVRIPScsICdIT01FPScsICdURVJNPScsICdIT1NUTkFNRT0nLCAnUFMxPScsCiAgICAnUzZfQ01EX1dBSVQnLCAnUzZfVkVSQk9TSVRZJywgJ1M2X1NUQUdFMicsCiAgICAnVklSVFVBTF9FTlY9JywgJ1BIUF9JTklfU0NBTl9ESVI9JywgJ0xTSU9fRklSU1RfUEFSVFk9JywKICAgICdMQU5HPScsICdMQ19BTEw9JywgJ0xBTkdVQUdFPScsICdERUJJQU5fRlJPTlRFTkQ9JywKICAgICdHUEdfS0VZPScsICdQWVRIT05fVkVSU0lPTj0nLCAnUFlUSE9OX1BJUF9WRVJTSU9OPScsCiAgICAnR09QQVRIPScsICdHT1NVX1ZFUlNJT049JywgJ0pBVkFfSE9NRT0nLAogICAgJ05PREVfVkVSU0lPTj0nLCAnWUFSTl9WRVJTSU9OPScsICdOUE1fQ09ORklHJywKICAgICdNWVNRTF9NQUpPUj0nLCAnTVlTUUxfVkVSU0lPTj0nLCAnTVlTUUxfU0hFTEwnLAogICAgJ01BUklBREJfTUFKT1I9JywgJ01BUklBREJfVkVSU0lPTj0nLAogICAgJ1BHX01BSk9SPScsICdQR19WRVJTSU9OPScsICdQR19TSEEyNTY9JywgJ1BHREFUQT0nLAogICAgJ0RPQ0tFUl9JTkZMVVhEQicsICdJTkZMVVhEQl9WRVJTSU9OPScsCiAgICAnR0ZfUEFUSFMnLCAnTkdJTlhfVkVSU0lPTj0nLAogICAgJ1pCWF8nLCAnTUFQSV8nLCAnVElOSV9WRVJTSU9OPScsCikKZm9yIGVudiBpbiAoYy5nZXQoJ0NvbmZpZycsIHt9KS5nZXQoJ0VudicpIG9yIFtdKToKICAgIGlmIG5vdCBhbnkoZW52LnN0YXJ0c3dpdGgocCkgZm9yIHAgaW4gc2tpcF9wcmVmaXhlcyk6CiAgICAgICAgIyBVc2Ugc2luZ2xlIHF1b3RlcywgZXNjYXBlIGFueSBzaW5nbGUgcXVvdGVzIGluIHZhbHVlCiAgICAgICAgc2FmZSA9IGVudi5yZXBsYWNlKCInIiwgIidcIidcIiciKQogICAgICAgIGFyZ3MuYXBwZW5kKCItZSAne30nIi5mb3JtYXQoc2FmZSkpCgojIFJlc3RhcnQgcG9saWN5CnJwID0gYy5nZXQoJ0hvc3RDb25maWcnLCB7fSkuZ2V0KCdSZXN0YXJ0UG9saWN5Jywge30pCnJlc3RhcnQgPSBycC5nZXQoJ05hbWUnLCAnJykKaWYgcmVzdGFydCBhbmQgcmVzdGFydCBub3QgaW4gKCdubycsICcnKToKICAgIG1heF9yZXRyeSA9IHJwLmdldCgnTWF4aW11bVJldHJ5Q291bnQnLCAwKQogICAgaWYgcmVzdGFydCA9PSAnb24tZmFpbHVyZScgYW5kIG1heF9yZXRyeSA+IDA6CiAgICAgICAgYXJncy5hcHBlbmQoJy0tcmVzdGFydCB7fTp7fScuZm9ybWF0KHJlc3RhcnQsIG1heF9yZXRyeSkpCiAgICBlbHNlOgogICAgICAgIGFyZ3MuYXBwZW5kKCctLXJlc3RhcnQgJyArIHJlc3RhcnQpCgojIE5ldHdvcmsKbmV0ID0gYy5nZXQoJ0hvc3RDb25maWcnLCB7fSkuZ2V0KCdOZXR3b3JrTW9kZScsICcnKQppZiBuZXQgYW5kIG5ldCBub3QgaW4gKCdkZWZhdWx0JywgJ2JyaWRnZScpOgogICAgYXJncy5hcHBlbmQoJy0tbmV0d29yayAnICsgbmV0KQoKIyBIb3N0bmFtZSAtIG9ubHkgaWYgY3VzdG9tCmhvc3RuYW1lID0gYy5nZXQoJ0NvbmZpZycsIHt9KS5nZXQoJ0hvc3RuYW1lJywgJycpCmNpZCA9IGMuZ2V0KCdJZCcsICcnKVs6MTJdCmlmIGhvc3RuYW1lIGFuZCBob3N0bmFtZSAhPSBjaWQgYW5kIGhvc3RuYW1lICE9IG5hbWU6CiAgICBwYXNzICAjIHNraXAgYXV0by1nZW5lcmF0ZWQgaG9zdG5hbWVzCgojIFByaXZpbGVnZWQKaWYgYy5nZXQoJ0hvc3RDb25maWcnLCB7fSkuZ2V0KCdQcml2aWxlZ2VkJyk6CiAgICBhcmdzLmFwcGVuZCgnLS1wcml2aWxlZ2VkJykKCiMgRGV2aWNlcwpmb3IgZGV2IGluIChjLmdldCgnSG9zdENvbmZpZycsIHt9KS5nZXQoJ0RldmljZXMnKSBvciBbXSk6CiAgICBhcmdzLmFwcGVuZCgnLS1kZXZpY2Uge306e30nLmZvcm1hdChkZXZbJ1BhdGhPbkhvc3QnXSwgZGV2WydQYXRoSW5Db250YWluZXInXSkpCgojIENhcCBhZGQKZm9yIGNhcCBpbiAoYy5nZXQoJ0hvc3RDb25maWcnLCB7fSkuZ2V0KCdDYXBBZGQnKSBvciBbXSk6CiAgICBhcmdzLmFwcGVuZCgnLS1jYXAtYWRkICcgKyBjYXApCgojIFBJRCBtb2RlCnBpZCA9IGMuZ2V0KCdIb3N0Q29uZmlnJywge30pLmdldCgnUGlkTW9kZScsICcnKQppZiBwaWQ6CiAgICBhcmdzLmFwcGVuZCgnLS1waWQgJyArIHBpZCkKCiMgTGFiZWxzIC0gc2tpcCBjb21wb3NlLCBPQ0ksIGFuZCBtYWludGFpbmVyIGxhYmVscwpza2lwX2xhYmVsX3ByZWZpeGVzID0gKCdjb20uZG9ja2VyLmNvbXBvc2UuJywgJ29yZy5vcGVuY29udGFpbmVycy4nLCAnZGVza3RvcC5kb2NrZXIuJykKc2tpcF9sYWJlbF9leGFjdCA9ICgnbWFpbnRhaW5lcicsKQpmb3IgaywgdiBpbiAoYy5nZXQoJ0NvbmZpZycsIHt9KS5nZXQoJ0xhYmVscycpIG9yIHt9KS5pdGVtcygpOgogICAgaWYgYW55KGsuc3RhcnRzd2l0aChwKSBmb3IgcCBpbiBza2lwX2xhYmVsX3ByZWZpeGVzKToKICAgICAgICBjb250aW51ZQogICAgaWYgayBpbiBza2lwX2xhYmVsX2V4YWN0OgogICAgICAgIGNvbnRpbnVlCiAgICBzYWZlX3YgPSB2LnJlcGxhY2UoIiciLCAiJ1wiJ1wiJyIpCiAgICBhcmdzLmFwcGVuZCgiLWwgJ3t9PXt9JyIuZm9ybWF0KGssIHNhZmVfdikpCgojIEltYWdlCmFyZ3MuYXBwZW5kKCctZCAnICsgY1snQ29uZmlnJ11bJ0ltYWdlJ10pCgojIENvbW1hbmQgKG9ubHkgaWYgZXhwbGljaXRseSBzZXQsIG5vdCBmcm9tIGltYWdlIGRlZmF1bHQpCiMgV2Ugc2tpcCBDbWQgaWYgaXQgbWF0Y2hlcyB0aGUgaW1hZ2UgZGVmYXVsdCB0byBhdm9pZCBkdXBsaWNhdGlvbgpjbWQgPSBjLmdldCgnQ29uZmlnJywge30pLmdldCgnQ21kJykKaWYgY21kOgogICAgYXJncy5hcHBlbmQoJyAnLmpvaW4oY21kKSkKCnByaW50KCcgJy5qb2luKGFyZ3MpKQpQWUVPRgogICAgOzsKICBjaGVjay1zdGF0dXMpCiAgICBkb2NrZXIgcHMgLS1maWx0ZXIgIm5hbWU9XiR7Q09OVEFJTkVSfSQiIC0tZm9ybWF0ICd7ey5TdGF0dXN9fScKICAgIDs7CmVzYWMK' | base64 -d > /tmp/docker-update-helper.sh && chmod +x /tmp/docker-update-helper.sh
+    - name: Deploy helper script
+      ansible.builtin.copy:
+        dest: /tmp/duh.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          case "$1" in
+            image-info)
+              docker inspect --format '{{ '{{' }}.Config.Image{{ '}}' }}|{{ '{{' }}.Image{{ '}}' }}' "$2" | sed 's|^/||'
+              ;;
+            compose-project)
+              docker inspect --format '{{ '{{' }}index .Config.Labels "com.docker.compose.project"{{ '}}' }}' "$2" 2>/dev/null || true
+              ;;
+            run-config)
+              JSON=$(docker inspect "$2" 2>/dev/null)
+              [ -z "$JSON" ] || [ "$JSON" = "[]" ] && { echo "empty inspect" >&2; exit 1; }
+              echo "$JSON" | python3 -c '
+          import sys, json
+
+          c = json.loads(sys.stdin.read())[0]
+          a = []
+
+          a.append("--name " + c["Name"].lstrip("/"))
+
+          for b in (c.get("HostConfig",{}).get("Binds") or []):
+              a.append("-v " + b)
+
+          for cp, binds in (c.get("HostConfig",{}).get("PortBindings") or {}).items():
+              if binds:
+                  for b in binds:
+                      ip, hp = b.get("HostIp",""), b.get("HostPort","")
+                      if ip and ip not in ("0.0.0.0","::",""):
+                          a.append(f"-p {ip}:{hp}:{cp}")
+                      elif hp:
+                          a.append(f"-p {hp}:{cp}")
+
+          skip = ("PATH=","HOME=","TERM=","HOSTNAME=","PS1=",
+                  "S6_CMD_WAIT","S6_VERBOSITY","S6_STAGE2",
+                  "VIRTUAL_ENV=","PHP_INI_SCAN_DIR=","LSIO_FIRST_PARTY=",
+                  "LANG=","LC_ALL=","LANGUAGE=","DEBIAN_FRONTEND=",
+                  "GPG_KEY=","PYTHON_VERSION=","PYTHON_PIP_VERSION=",
+                  "GOPATH=","GOSU_VERSION=","JAVA_HOME=",
+                  "NODE_VERSION=","YARN_VERSION=","NPM_CONFIG",
+                  "MYSQL_MAJOR=","MYSQL_VERSION=","MYSQL_SHELL",
+                  "MARIADB_MAJOR=","MARIADB_VERSION=",
+                  "PG_MAJOR=","PG_VERSION=","PG_SHA256=","PGDATA=",
+                  "DOCKER_INFLUXDB","INFLUXDB_VERSION=",
+                  "GF_PATHS","NGINX_VERSION=",
+                  "ZBX_","MAPI_","TINI_VERSION=")
+          for e in (c.get("Config",{}).get("Env") or []):
+              if not any(e.startswith(p) for p in skip):
+                  a.append("-e " + repr(e))
+
+          rp = c.get("HostConfig",{}).get("RestartPolicy",{})
+          rn = rp.get("Name","")
+          if rn and rn != "no":
+              mr = rp.get("MaximumRetryCount",0)
+              a.append(f"--restart {rn}:{mr}" if rn=="on-failure" and mr>0 else f"--restart {rn}")
+
+          net = c.get("HostConfig",{}).get("NetworkMode","")
+          if net and net not in ("default","bridge"):
+              a.append("--network " + net)
+
+          if c.get("HostConfig",{}).get("Privileged"):
+              a.append("--privileged")
+
+          for d in (c.get("HostConfig",{}).get("Devices") or []):
+              a.append(f"--device {d[\"PathOnHost\"]}:{d[\"PathInContainer\"]}")
+
+          for cap in (c.get("HostConfig",{}).get("CapAdd") or []):
+              a.append("--cap-add " + cap)
+
+          pid = c.get("HostConfig",{}).get("PidMode","")
+          if pid:
+              a.append("--pid " + pid)
+
+          skip_lp = ("com.docker.compose.","org.opencontainers.","desktop.docker.")
+          for k,v in (c.get("Config",{}).get("Labels") or {}).items():
+              if any(k.startswith(p) for p in skip_lp) or k == "maintainer":
+                  continue
+              a.append(f"-l {repr(k+\"=\"+v)}")
+
+          a.append("-d " + c["Config"]["Image"])
+
+          cmd = c.get("Config",{}).get("Cmd")
+          if cmd:
+              a.append(" ".join(cmd))
+
+          print(" ".join(a))
+          '
+              ;;
+            status)
+              docker ps --filter "name=^${2}$" --format '{{ '{{' }}.Status{{ '}}' }}'
+              ;;
+          esac
+
+    # ──────────────────────────────────────────────
+    # 3. Snapshot current state (image + digest per container)
+    # ──────────────────────────────────────────────
+
+    - name: Get current image info
+      ansible.builtin.command: /tmp/duh.sh image-info {{ item }}
+      loop: "{{ _running }}"
+      register: _img_info
       changed_when: false
 
-    # ──────────────────────────────────────────────
-    # 3. Get current image digests for comparison
-    # ──────────────────────────────────────────────
-
-    - name: Get current image info per container
-      ansible.builtin.command: /tmp/docker-update-helper.sh get-image {{ item }}
-      loop: "{{ _running_containers }}"
-      register: _container_images
-      changed_when: false
-
-    - name: Build container image map
+    - name: Build image map
       ansible.builtin.set_fact:
-        _container_map: >-
-          {{ _container_map | default({}) | combine({
-            item.stdout.split('|')[0]: {
-              'image': item.stdout.split('|')[1],
-              'old_digest': item.stdout.split('|')[2]
+        _img_map: >-
+          {{ _img_map | default({}) | combine({
+            item.item: {
+              'image': item.stdout.split('|')[0],
+              'digest': item.stdout.split('|')[1]
             }
           }) }}
-      loop: "{{ _container_images.results }}"
+      loop: "{{ _img_info.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     # ──────────────────────────────────────────────
-    # 4. Pull latest images
+    # 4. Pull ALL latest images upfront (no downtime yet)
     # ──────────────────────────────────────────────
 
-    - name: Get unique images to pull
+    - name: Unique images to pull
       ansible.builtin.set_fact:
-        _unique_images: "{{ _container_map.values() | map(attribute='image') | unique | list }}"
+        _images: "{{ _img_map.values() | map(attribute='image') | unique | list }}"
 
-    - name: Display images to pull
-      ansible.builtin.debug:
-        msg: "Pulling {{ _unique_images | length }} unique images: {{ _unique_images | join(', ') }}"
-
-    - name: Pull latest images
+    - name: "Pull {{ _images | length }} unique images"
       ansible.builtin.command: "docker pull {{ item }}"
-      loop: "{{ _unique_images }}"
-      register: _pull_results
-      changed_when: "'Downloaded newer image' in item.stdout | default('') or 'Pull complete' in item.stdout | default('')"
+      loop: "{{ _images }}"
+      register: _pulls
+      changed_when: false
 
     # ──────────────────────────────────────────────
-    # 5. Check which containers need updating
+    # 5. Compare digests — what actually changed?
     # ──────────────────────────────────────────────
 
-    - name: Get new image digests after pull
-      ansible.builtin.shell: "docker image inspect {{ item.value.image }} | python3 -c \"import sys,json; print(json.loads(sys.stdin.read())[0]['Id'])\""
-      loop: "{{ _container_map | dict2items }}"
+    - name: Get new digests after pull
+      ansible.builtin.shell: >
+        docker image inspect {{ item.value.image }} --format '{{ '{{' }}.Id{{ '}}' }}'
+      loop: "{{ _img_map | dict2items }}"
       register: _new_digests
       changed_when: false
 
-    - name: Build update list
+    - name: Find containers with changed images
       ansible.builtin.set_fact:
-        _containers_to_update: >-
-          {{ _containers_to_update | default([]) +
-            ([item.item.key] if item.stdout != _container_map[item.item.key].old_digest else [])
+        _changed: >-
+          {{ _changed | default([]) +
+            ([item.item.key] if item.stdout != _img_map[item.item.key].digest else [])
           }}
       loop: "{{ _new_digests.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
 
-    - name: Set update list to empty if undefined
+    - name: Default empty changed list
       ansible.builtin.set_fact:
-        _containers_to_update: "{{ _containers_to_update | default([]) }}"
+        _changed: "{{ _changed | default([]) }}"
 
-    - name: Display containers that need updating
+    # ──────────────────────────────────────────────
+    # 5a. NOTHING CHANGED → skip to notification
+    # ──────────────────────────────────────────────
+
+    - name: Nothing to update — skip to cleanup
+      when: _changed | length == 0
+      block:
+        - name: Report all up to date
+          ansible.builtin.debug:
+            msg: "All {{ _running | length }} containers are already running latest images — nothing to do."
+
+    # ──────────────────────────────────────────────
+    # 6. Build dependency groups & expand update list
+    # ──────────────────────────────────────────────
+
+    - name: Detect compose projects
+      ansible.builtin.command: /tmp/duh.sh compose-project {{ item }}
+      loop: "{{ _running }}"
+      register: _compose
+      changed_when: false
+      when: _changed | length > 0
+
+    - name: Build groups and expand update list
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json
+
+        running = json.loads("""{{ _running | to_json }}""")
+        changed = json.loads("""{{ _changed | to_json }}""")
+        manual = json.loads("""{{ manual_groups | to_json }}""")
+        compose_results = json.loads("""{{ _compose.results | default([]) | to_json }}""")
+
+        # Map container → group
+        c2g = {}
+        for r in compose_results:
+            name = r.get("item", "")
+            proj = (r.get("stdout") or "").strip()
+            if proj:
+                c2g[name] = "compose:" + proj
+                continue
+            # Check manual groups
+            for gname, members in manual.items():
+                if name in members:
+                    c2g[name] = gname
+                    break
+            else:
+                c2g[name] = "__standalone:" + name
+
+        # Invert: group → [containers] (preserving manual order)
+        g2c = {}
+        for container, group in c2g.items():
+            g2c.setdefault(group, []).append(container)
+
+        # Apply manual ordering where defined
+        for gname in list(g2c.keys()):
+            base = gname.replace("compose:", "")
+            if base in manual:
+                ordered = [c for c in manual[base] if c in g2c[gname]]
+                extras = [c for c in g2c[gname] if c not in ordered]
+                g2c[gname] = ordered + extras
+            elif not gname.startswith("__standalone:"):
+                g2c[gname] = sorted(g2c[gname])
+
+        # Which groups are affected?
+        affected_groups = list(set(c2g[c] for c in changed if c in c2g))
+
+        # Expand: all containers in affected groups
+        to_update = []
+        for g in affected_groups:
+            for c in g2c[g]:
+                if c not in to_update:
+                    to_update.append(c)
+
+        result = {
+            "container_group_map": c2g,
+            "group_containers": g2c,
+            "affected_groups": affected_groups,
+            "to_update": to_update,
+        }
+        print(json.dumps(result))
+        PYEOF
+      register: _groups_raw
+      changed_when: false
+      when: _changed | length > 0
+
+    - name: Set group facts
+      ansible.builtin.set_fact:
+        _g: "{{ _groups_raw.stdout | from_json }}"
+      when: _changed | length > 0
+
+    - name: Set empty group facts when nothing changed
+      ansible.builtin.set_fact:
+        _g:
+          affected_groups: []
+          to_update: []
+          group_containers: {}
+      when: _changed | length == 0
+
+    - name: Display update plan
       ansible.builtin.debug:
         msg: >-
-          {{ _containers_to_update | length }} container(s) need updating:
-          {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None — all images are latest' }}
+          {{ _changed | length }} image(s) changed: {{ _changed | join(', ') }}.
+          {{ _g.affected_groups | length }} group(s) affected → {{ _g.to_update | length }} container(s) to recreate: {{ _g.to_update | join(', ') }}
+      when: _changed | length > 0
 
     # ──────────────────────────────────────────────
-    # 6. Recreate containers with new images
+    # 7. Collect run configs BEFORE stopping anything
     # ──────────────────────────────────────────────
 
-    - name: Get full container run config
-      ansible.builtin.command: /tmp/docker-update-helper.sh get-run-config {{ item }}
-      loop: "{{ _containers_to_update }}"
-      register: _container_configs
+    - name: Collect run configs (while containers still running)
+      ansible.builtin.shell: /tmp/duh.sh run-config {{ item }}
+      loop: "{{ _g.to_update }}"
+      register: _configs
       changed_when: false
-      when: _containers_to_update | length > 0
+      when: _g.to_update | length > 0
 
-    - name: Stop old container
-      ansible.builtin.command: docker stop {{ item.item }}
-      loop: "{{ _container_configs.results | default([]) }}"
+    - name: Build config lookup
+      ansible.builtin.set_fact:
+        _cfg: >-
+          {{ _cfg | default({}) | combine({ item.item: item.stdout | trim }) }}
+      loop: "{{ _configs.results | default([]) }}"
       loop_control:
         label: "{{ item.item }}"
-      when: _containers_to_update | length > 0
+      when: _g.to_update | length > 0
 
-    - name: Remove old container
-      ansible.builtin.command: docker rm {{ item.item }}
-      loop: "{{ _container_configs.results | default([]) }}"
-      loop_control:
-        label: "{{ item.item }}"
-      when: _containers_to_update | length > 0
+    # ──────────────────────────────────────────────
+    # 8. Fast recreate per group (minimal downtime)
+    #    Stop reverse → rm → run forward
+    # ──────────────────────────────────────────────
 
-    - name: Recreate container with new image
-      ansible.builtin.shell: "docker run {{ item.stdout | trim }}"
-      loop: "{{ _container_configs.results | default([]) }}"
-      loop_control:
-        label: "{{ item.item }}"
-      register: _recreate_results
-      when: _containers_to_update | length > 0
+    - name: Recreate containers (group-aware, minimal downtime)
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, subprocess, sys, time
+
+        affected = json.loads("""{{ _g.affected_groups | to_json }}""")
+        g2c = json.loads("""{{ _g.group_containers | to_json }}""")
+        to_update = json.loads("""{{ _g.to_update | to_json }}""")
+        cfg = json.loads("""{{ _cfg | to_json }}""")
+
+        ok, fail = [], []
+
+        for group in affected:
+            members = [c for c in g2c[group] if c in to_update]
+            if not members:
+                continue
+
+            rev = list(reversed(members))
+            print(f"\n{'='*60}")
+            print(f"  {group}: {' → '.join(members)}")
+            print(f"{'='*60}")
+
+            # ── Stop (reverse: dependents first) ──
+            for c in rev:
+                print(f"  stop  {c} ...", end=" ", flush=True)
+                r = subprocess.run(["docker", "stop", "-t", "10", c],
+                                   capture_output=True, text=True)
+                print("ok" if r.returncode == 0 else f"WARN {r.stderr.strip()}")
+
+            # ── Remove ──
+            for c in rev:
+                print(f"  rm    {c} ...", end=" ", flush=True)
+                r = subprocess.run(["docker", "rm", c],
+                                   capture_output=True, text=True)
+                print("ok" if r.returncode == 0 else f"WARN {r.stderr.strip()}")
+
+            # ── Start (forward: dependencies first) ──
+            for c in members:
+                conf = cfg.get(c)
+                if not conf:
+                    print(f"  ERROR: no config for {c}")
+                    fail.append(c)
+                    continue
+                print(f"  run   {c} ...", end=" ", flush=True)
+                r = subprocess.run(f"docker run {conf}", shell=True,
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    print("ok")
+                    ok.append(c)
+                else:
+                    print(f"FAIL {r.stderr.strip()}")
+                    fail.append(c)
+
+            # Brief stabilization pause between groups
+            if group != affected[-1]:
+                time.sleep(5)
+
+        print(f"\n{'='*60}")
+        print(f"  Done: {len(ok)} ok, {len(fail)} failed")
+        if fail:
+            print(f"  Failed: {', '.join(fail)}")
+            sys.exit(1)
+        PYEOF
+      register: _recreate
+      changed_when: true
+      when: _g.to_update | length > 0
+
+    - name: Show recreate output
+      ansible.builtin.debug:
+        msg: "{{ _recreate.stdout_lines }}"
+      when: _g.to_update | length > 0
+
+    # ──────────────────────────────────────────────
+    # 9. Verify
+    # ──────────────────────────────────────────────
 
     - name: Verify containers are running
-      ansible.builtin.command: /tmp/docker-update-helper.sh check-status {{ item }}
-      loop: "{{ _containers_to_update }}"
-      register: _verify_results
-      failed_when: "'Up' not in _verify_results.stdout"
+      ansible.builtin.command: /tmp/duh.sh status {{ item }}
+      loop: "{{ _g.to_update }}"
+      register: _verify
+      failed_when: "'Up' not in _verify.stdout"
       changed_when: false
-      when: _containers_to_update | length > 0
+      when: _g.to_update | length > 0
 
     # ──────────────────────────────────────────────
-    # 7. Cleanup
+    # 10. Cleanup
     # ──────────────────────────────────────────────
 
     - name: Docker cleanup
@@ -171,26 +464,26 @@
       block:
         - name: Prune dangling images
           ansible.builtin.command: docker image prune -f
-          register: _prune_images
-          changed_when: "'Total reclaimed space: 0B' not in _prune_images.stdout"
+          register: _prune_img
+          changed_when: "'Total reclaimed space: 0B' not in _prune_img.stdout"
 
         - name: Prune unused volumes
           ansible.builtin.command: docker volume prune -f
-          register: _prune_volumes
-          changed_when: "'Total reclaimed space: 0B' not in _prune_volumes.stdout"
+          register: _prune_vol
+          changed_when: "'Total reclaimed space: 0B' not in _prune_vol.stdout"
 
         - name: Prune unused networks
           ansible.builtin.command: docker network prune -f
-          register: _prune_networks
-          changed_when: "'Deleted Networks' in _prune_networks.stdout"
+          register: _prune_net
+          changed_when: "'Deleted Networks' in _prune_net.stdout"
 
     - name: Remove helper script
       ansible.builtin.file:
-        path: /tmp/docker-update-helper.sh
+        path: /tmp/duh.sh
         state: absent
 
     # ──────────────────────────────────────────────
-    # 8. Gotify Notification
+    # 11. Gotify notification
     # ──────────────────────────────────────────────
 
     - name: Ensure curl is installed
@@ -198,28 +491,29 @@
         name: curl
         state: present
 
-    - name: Build Gotify notification metadata
+    - name: Build notification
       ansible.builtin.set_fact:
-        _gotify_title: >-
-          {{ '🐳 ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — ' +
-             (_containers_to_update | length | string) + ' container(s) updated'
-             if _containers_to_update | length > 0
-             else '🐳 ' + ansible_hostname + ' (' + ansible_default_ipv4.address + ') — All containers up to date' }}
-        _gotify_priority: "{{ 6 if _containers_to_update | length > 0 else gotify_priority }}"
-
-    - name: Build Gotify message body
-      ansible.builtin.set_fact:
-        _gotify_message: >-
-          🖥️ **Host:** {{ ansible_hostname }}\n\n🌐
-          **IP:** {{ ansible_default_ipv4.address }}\n\n🐳
-          **Containers running:** {{ _running_containers | length }}\n\n📦
-          **Updated:** {{ _containers_to_update | length }}\n\n{{
-          '🔄 **Updated containers:**\n' + _containers_to_update | join(', ') + '\n\n'
-          if _containers_to_update | length > 0
-          else '' }}---\n\n{{
-          '✅ **All containers recreated and running**'
-          if _containers_to_update | length > 0
-          else '✅ **All images are already latest**' }}
+        _ntfy_title: >-
+          {{ '🐳 ' + ansible_hostname + ' — ' +
+             (_changed | length | string) + ' updated, ' +
+             (_g.to_update | length | string) + ' recreated'
+             if _g.to_update | length > 0
+             else '🐳 ' + ansible_hostname + ' — All up to date' }}
+        _ntfy_body: >-
+          🖥️ **Host:** {{ ansible_hostname }} ({{ ansible_default_ipv4.address }})\n\n🐳
+          **Running:** {{ _running | length }}\n\n📦
+          **New images:** {{ _changed | length }}\n\n🔄
+          **Recreated:** {{ _g.to_update | length }}\n\n{{
+          '🆕 **Changed:** ' + _changed | join(', ') + '\n\n'
+          if _changed | length > 0 else '' }}{{
+          '🔗 **Groups:** ' + _g.affected_groups | join(', ') + '\n\n'
+          if _g.affected_groups | length > 0 else '' }}{{
+          '♻️ **Recreated:** ' + _g.to_update | join(', ') + '\n\n'
+          if _g.to_update | length > 0 else '' }}---\n\n{{
+          '✅ All containers recreated and verified'
+          if _g.to_update | length > 0
+          else '✅ All images already latest' }}
+        _ntfy_prio: "{{ 6 if _g.to_update | length > 0 else gotify_priority }}"
 
     - name: Send Gotify notification
       ansible.builtin.shell: |
@@ -229,28 +523,26 @@
           -H "Content-Type: application/json" \
           -d @-
         {
-          "title": "{{ _gotify_title | trim }}",
-          "message": "{{ _gotify_message | trim }}",
-          "priority": {{ _gotify_priority }},
+          "title": "{{ _ntfy_title | trim }}",
+          "message": "{{ _ntfy_body | trim }}",
+          "priority": {{ _ntfy_prio }},
           "extras": {"client::display": {"contentType": "text/markdown"}}
         }
         PAYLOAD
-      register: gotify_response
+      register: _gotify
       changed_when: false
-      failed_when: gotify_response.stdout != "200"
+      failed_when: _gotify.stdout != "200"
 
     # ──────────────────────────────────────────────
-    # 9. Final Status
+    # 12. Summary
     # ──────────────────────────────────────────────
 
-    - name: Display final status
+    - name: Final status
       ansible.builtin.debug:
         msg:
           - "Host: {{ ansible_hostname }} ({{ inventory_hostname }})"
-          - "Total containers: {{ _running_containers | length }}"
-          - "Containers updated: {{ _containers_to_update | length }}"
-          - "Updated: {{ _containers_to_update | join(', ') if _containers_to_update | length > 0 else 'None' }}"
-          - "Excluded: {{ exclude_containers | join(', ') }}"
-          - "Cleanup — Images pruned: {{ 'Yes' if _prune_images.changed | default(false) else 'No' }}"
-          - "Cleanup — Volumes pruned: {{ 'Yes' if _prune_volumes.changed | default(false) else 'No' }}"
-          - "Cleanup — Networks pruned: {{ 'Yes' if _prune_networks.changed | default(false) else 'No' }}"
+          - "Containers: {{ _running | length }} running, {{ exclude_containers | length }} excluded"
+          - "Images changed: {{ _changed | length }} — {{ _changed | join(', ') if _changed | length > 0 else 'None' }}"
+          - "Groups affected: {{ _g.affected_groups | join(', ') if _g.affected_groups | length > 0 else 'None' }}"
+          - "Recreated: {{ _g.to_update | length }} — {{ _g.to_update | join(', ') if _g.to_update | length > 0 else 'None' }}"
+          - "Cleanup: images={{ 'yes' if _prune_img.changed | default(false) else 'no' }} volumes={{ 'yes' if _prune_vol.changed | default(false) else 'no' }} networks={{ 'yes' if _prune_net.changed | default(false) else 'no' }}"
