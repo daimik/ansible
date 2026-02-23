@@ -3,6 +3,7 @@
 # Core and Supervisor don't reboot, OS does.
 # Each update waits for HA to be fully available before proceeding.
 # If any update fails, the playbook stops - no further updates are attempted.
+# After updates, old backups are pruned to keep only the last 3.
 #
 # Required extra-vars (set in Semaphore Environment):
 #   ha_url         - Home Assistant URL (e.g. http://homeassistan.com)
@@ -20,6 +21,7 @@
     gotify_url: "{{ lookup('env', 'GOTIFY_URL') | default(gotify_url, true) }}"
     gotify_token: "{{ lookup('env', 'GOTIFY_TOKEN') | default(gotify_token, true) }}"
     gotify_priority: 5
+    backups_to_keep: 3
 
   tasks:
     # -------------------------------------------------------
@@ -265,7 +267,56 @@
       when: os_needs_update
 
     # -------------------------------------------------------
-    # Phase 6: Final summary
+    # Phase 6: Backup retention — keep only last N backups
+    # Uses Supervisor API via /api/hassio/ proxy.
+    # Lists all backups, sorts by date, deletes oldest ones.
+    # -------------------------------------------------------
+    - name: Get list of all backups
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/hassio/backups"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
+        status_code: 200
+      register: backup_list
+
+    - name: Determine backups to delete (keep newest {{ backups_to_keep }})
+      ansible.builtin.set_fact:
+        backups_sorted: "{{ backup_list.json.data.backups | sort(attribute='date') | reverse | list }}"
+
+    - name: Set backups to remove
+      ansible.builtin.set_fact:
+        backups_to_remove: "{{ backups_sorted[backups_to_keep:] }}"
+
+    - name: Display backup retention plan
+      ansible.builtin.debug:
+        msg: |
+          === Backup Retention ===
+          Total backups: {{ backups_sorted | length }}
+          Keeping: {{ [backups_sorted | length, backups_to_keep] | min }}
+          Deleting: {{ backups_to_remove | length }}
+          {% for b in backups_sorted[:backups_to_keep] %}
+          ✅ KEEP: {{ b.name | default(b.slug) }} ({{ b.date }})
+          {% endfor %}
+          {% for b in backups_to_remove %}
+          🗑️ DELETE: {{ b.name | default(b.slug) }} ({{ b.date }})
+          {% endfor %}
+
+    - name: Delete old backups
+      ansible.builtin.uri:
+        url: "{{ ha_url }}/api/hassio/backups/{{ item.slug }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ vault_ha_token }}"
+        status_code: [200, 204]
+      loop: "{{ backups_to_remove }}"
+      loop_control:
+        label: "{{ item.name | default(item.slug) }} ({{ item.date }})"
+      when: backups_to_remove | length > 0
+
+    # -------------------------------------------------------
+    # Phase 7: Final summary
     # -------------------------------------------------------
     - name: Update summary
       ansible.builtin.debug:
@@ -274,9 +325,10 @@
           Core:       {{ 'Updated to ' + core_update.json.attributes.latest_version if core_needs_update else 'Already up to date (' + core_update.json.attributes.installed_version + ')' }}
           Supervisor: {{ 'Updated to ' + supervisor_update.json.attributes.latest_version if supervisor_needs_update else 'Already up to date (' + supervisor_update.json.attributes.installed_version + ')' }}
           OS:         {{ 'Updated to ' + os_update.json.attributes.latest_version if os_needs_update else 'Already up to date (' + os_update.json.attributes.installed_version + ')' }}
+          Backups:    {{ backups_to_remove | length }} old backup(s) removed, {{ [backups_sorted | length, backups_to_keep] | min }} retained
 
     # -------------------------------------------------------
-    # Phase 7: Gotify notification (updates were performed)
+    # Phase 8: Gotify notification (updates were performed)
     # -------------------------------------------------------
     - name: Send Gotify notification (updates completed)
       ansible.builtin.shell: |
@@ -287,7 +339,7 @@
           -d @-
         {
           "title": "🏠 Home Assistant — Updated successfully",
-          "message": "🏠 **Home Assistant**\n\n🔧 **Core:** {{ core_update.json.attributes.installed_version }} → {{ core_update.json.attributes.latest_version }} {{ '✅ Updated' if core_needs_update else '— No change' }}\n\n🔧 **Supervisor:** {{ supervisor_update.json.attributes.installed_version }} → {{ supervisor_update.json.attributes.latest_version }} {{ '✅ Updated' if supervisor_needs_update else '— No change' }}\n\n🔧 **OS:** {{ os_update.json.attributes.installed_version }} → {{ os_update.json.attributes.latest_version }} {{ '✅ Updated' if os_needs_update else '— No change' }}\n\n---\n\n{{ '🔄 **OS was updated — system rebooted**' if os_needs_update else '✅ **All updates applied — no reboot needed**' }}",
+          "message": "🏠 **Home Assistant**\n\n🔧 **Core:** {{ core_update.json.attributes.installed_version }} → {{ core_update.json.attributes.latest_version }} {{ '✅ Updated' if core_needs_update else '— No change' }}\n\n🔧 **Supervisor:** {{ supervisor_update.json.attributes.installed_version }} → {{ supervisor_update.json.attributes.latest_version }} {{ '✅ Updated' if supervisor_needs_update else '— No change' }}\n\n🔧 **OS:** {{ os_update.json.attributes.installed_version }} → {{ os_update.json.attributes.latest_version }} {{ '✅ Updated' if os_needs_update else '— No change' }}\n\n🗑️ **Backups:** {{ backups_to_remove | length }} removed, {{ [backups_sorted | length, backups_to_keep] | min }} kept\n\n---\n\n{{ '🔄 **OS was updated — system rebooted**' if os_needs_update else '✅ **All updates applied — no reboot needed**' }}",
           "priority": {{ 8 if os_needs_update else gotify_priority }},
           "extras": {"client::display": {"contentType": "text/markdown"}}
         }
