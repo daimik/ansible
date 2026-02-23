@@ -108,9 +108,9 @@
     # -------------------------------------------------------
     # Phase 2: Backup via Supervisor API (only if any update)
     # -------------------------------------------------------
-    - name: Create full backup before updating (Supervisor API)
+    - name: Create full backup before updating
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/hassio/backups/new/full"
+        url: "{{ ha_url }}/api/services/hassio/backup_full"
         method: POST
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
@@ -120,7 +120,6 @@
           name: "ansible-pre-update-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
         status_code: [200, 201]
         timeout: 600
-      register: backup_result
       when: any_update_available
 
     - name: Display backup result
