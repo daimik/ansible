@@ -108,16 +108,15 @@
     # -------------------------------------------------------
     # Phase 2: Backup (only if any update is available)
     # -------------------------------------------------------
-    - name: Create backup before updating
+    - name: Create backup before updating (uses automatic backup settings)
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/services/backup/create"
+        url: "{{ ha_url }}/api/services/backup/create_automatic"
         method: POST
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
           Content-Type: "application/json"
         body_format: json
-        body:
-          title: "ansible-pre-update-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+        body: {}
         status_code: [200, 201]
       when: any_update_available
 
