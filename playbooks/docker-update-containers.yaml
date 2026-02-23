@@ -113,11 +113,12 @@
           for cp, binds in (c.get("HostConfig",{}).get("PortBindings") or {}).items():
               if binds:
                   for b in binds:
-                      ip, hp = b.get("HostIp",""), b.get("HostPort","")
+                      ip = b.get("HostIp","")
+                      hp = b.get("HostPort","")
                       if ip and ip not in ("0.0.0.0","::",""):
-                          a.append(f"-p {ip}:{hp}:{cp}")
+                          a.append("-p {}:{}:{}".format(ip, hp, cp))
                       elif hp:
-                          a.append(f"-p {hp}:{cp}")
+                          a.append("-p {}:{}".format(hp, cp))
 
           skip = ("PATH=","HOME=","TERM=","HOSTNAME=","PS1=",
                   "S6_CMD_WAIT","S6_VERBOSITY","S6_STAGE2",
@@ -140,7 +141,10 @@
           rn = rp.get("Name","")
           if rn and rn != "no":
               mr = rp.get("MaximumRetryCount",0)
-              a.append(f"--restart {rn}:{mr}" if rn=="on-failure" and mr>0 else f"--restart {rn}")
+              if rn == "on-failure" and mr > 0:
+                  a.append("--restart {}:{}".format(rn, mr))
+              else:
+                  a.append("--restart " + rn)
 
           net = c.get("HostConfig",{}).get("NetworkMode","")
           if net and net not in ("default","bridge"):
@@ -150,7 +154,9 @@
               a.append("--privileged")
 
           for d in (c.get("HostConfig",{}).get("Devices") or []):
-              a.append(f"--device {d[\"PathOnHost\"]}:{d[\"PathInContainer\"]}")
+              host_path = d["PathOnHost"]
+              cont_path = d["PathInContainer"]
+              a.append("--device {}:{}".format(host_path, cont_path))
 
           for cap in (c.get("HostConfig",{}).get("CapAdd") or []):
               a.append("--cap-add " + cap)
@@ -163,7 +169,7 @@
           for k,v in (c.get("Config",{}).get("Labels") or {}).items():
               if any(k.startswith(p) for p in skip_lp) or k == "maintainer":
                   continue
-              a.append(f"-l {repr(k+\"=\"+v)}")
+              a.append("-l " + repr(k + "=" + v))
 
           a.append("-d " + c["Config"]["Image"])
 
@@ -273,7 +279,7 @@
         manual = json.loads("""{{ manual_groups | to_json }}""")
         compose_results = json.loads("""{{ _compose.results | default([]) | to_json }}""")
 
-        # Map container → group
+        # Map container -> group
         c2g = {}
         for r in compose_results:
             name = r.get("item", "")
@@ -289,7 +295,7 @@
             else:
                 c2g[name] = "__standalone:" + name
 
-        # Invert: group → [containers] (preserving manual order)
+        # Invert: group -> [containers] (preserving manual order)
         g2c = {}
         for container, group in c2g.items():
             g2c.setdefault(group, []).append(container)
@@ -343,7 +349,8 @@
       ansible.builtin.debug:
         msg: >-
           {{ _changed | length }} image(s) changed: {{ _changed | join(', ') }}.
-          {{ _g.affected_groups | length }} group(s) affected → {{ _g.to_update | length }} container(s) to recreate: {{ _g.to_update | join(', ') }}
+          {{ _g.affected_groups | length }} group(s) affected →
+          {{ _g.to_update | length }} container(s) to recreate: {{ _g.to_update | join(', ') }}
       when: _changed | length > 0
 
     # ──────────────────────────────────────────────
@@ -389,49 +396,52 @@
                 continue
 
             rev = list(reversed(members))
-            print(f"\n{'='*60}")
-            print(f"  {group}: {' → '.join(members)}")
-            print(f"{'='*60}")
+            print("=" * 60)
+            print("  {}: {}".format(group, " -> ".join(members)))
+            print("=" * 60)
 
-            # ── Stop (reverse: dependents first) ──
+            # Stop (reverse: dependents first)
             for c in rev:
-                print(f"  stop  {c} ...", end=" ", flush=True)
+                sys.stdout.write("  stop  {} ... ".format(c))
+                sys.stdout.flush()
                 r = subprocess.run(["docker", "stop", "-t", "10", c],
                                    capture_output=True, text=True)
-                print("ok" if r.returncode == 0 else f"WARN {r.stderr.strip()}")
+                print("ok" if r.returncode == 0 else "WARN " + r.stderr.strip())
 
-            # ── Remove ──
+            # Remove
             for c in rev:
-                print(f"  rm    {c} ...", end=" ", flush=True)
+                sys.stdout.write("  rm    {} ... ".format(c))
+                sys.stdout.flush()
                 r = subprocess.run(["docker", "rm", c],
                                    capture_output=True, text=True)
-                print("ok" if r.returncode == 0 else f"WARN {r.stderr.strip()}")
+                print("ok" if r.returncode == 0 else "WARN " + r.stderr.strip())
 
-            # ── Start (forward: dependencies first) ──
+            # Start (forward: dependencies first)
             for c in members:
                 conf = cfg.get(c)
                 if not conf:
-                    print(f"  ERROR: no config for {c}")
+                    print("  ERROR: no config for {}".format(c))
                     fail.append(c)
                     continue
-                print(f"  run   {c} ...", end=" ", flush=True)
-                r = subprocess.run(f"docker run {conf}", shell=True,
+                sys.stdout.write("  run   {} ... ".format(c))
+                sys.stdout.flush()
+                r = subprocess.run("docker run " + conf, shell=True,
                                    capture_output=True, text=True)
                 if r.returncode == 0:
                     print("ok")
                     ok.append(c)
                 else:
-                    print(f"FAIL {r.stderr.strip()}")
+                    print("FAIL " + r.stderr.strip())
                     fail.append(c)
 
             # Brief stabilization pause between groups
             if group != affected[-1]:
                 time.sleep(5)
 
-        print(f"\n{'='*60}")
-        print(f"  Done: {len(ok)} ok, {len(fail)} failed")
+        print("=" * 60)
+        print("  Done: {} ok, {} failed".format(len(ok), len(fail)))
         if fail:
-            print(f"  Failed: {', '.join(fail)}")
+            print("  Failed: {}".format(", ".join(fail)))
             sys.exit(1)
         PYEOF
       register: _recreate
