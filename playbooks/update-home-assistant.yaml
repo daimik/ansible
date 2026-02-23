@@ -1,21 +1,27 @@
 ---
-# DIAGNOSTIC RUN - find correct backup list parsing
-# Remove this after confirming the response structure
-
-- name: Debug backup API responses
+- name: Debug backup sensor data
   hosts: homeassistant
   gather_facts: false
 
   tasks:
-    - name: Check HA API is reachable
+    - name: Get backup_backup_manager_state sensor
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/"
+        url: "{{ ha_url }}/api/states/sensor.backup_backup_manager_state"
         method: GET
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
+        return_content: true
         status_code: 200
+      register: backup_mgr
 
-    - name: Get backup list via template API
+    - name: Show backup manager sensor
+      ansible.builtin.debug:
+        msg: |
+          State: {{ backup_mgr.json.state }}
+          Attributes keys: {{ backup_mgr.json.attributes.keys() | list }}
+          Full attributes: {{ backup_mgr.json.attributes | to_nice_json }}
+
+    - name: Query backups via template API
       ansible.builtin.uri:
         url: "{{ ha_url }}/api/template"
         method: POST
@@ -24,43 +30,37 @@
           Content-Type: "application/json"
         body_format: json
         body:
-          template: "{{ '{{' }} states | selectattr('entity_id', 'match', 'sensor.*backup.*') | map(attribute='entity_id') | list | tojson {{ '}}' }}"
+          template: >-
+            {{ '{{' }} states.sensor
+            | selectattr('entity_id', 'match', 'sensor.backup_')
+            | map(attribute='entity_id')
+            | list
+            | tojson {{ '}}' }}
         return_content: true
         status_code: 200
-      register: backup_sensors
+      register: all_backup_sensors
 
-    - name: Show backup-related sensors
+    - name: Show all backup sensors
       ansible.builtin.debug:
-        msg: "Backup sensors found: {{ backup_sensors.content }}"
+        msg: "{{ all_backup_sensors.content }}"
 
-    - name: Get hassio backups info
+    - name: Try to get backup list from HA internal backup manager
       ansible.builtin.uri:
-        url: "{{ ha_url }}/api/hassio/backups/info"
-        method: GET
+        url: "{{ ha_url }}/api/template"
+        method: POST
         headers:
           Authorization: "Bearer {{ vault_ha_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          template: >-
+            {{ '{{' }} state_attr('sensor.backup_backup_manager_state', 'backups')
+            | default('NO_BACKUPS_ATTR', true)
+            {{ '}}' }}
         return_content: true
         status_code: 200
-      register: hassio_info
+      register: backups_from_attr
 
-    - name: Show hassio backups info - top level keys
+    - name: Show backups from attribute
       ansible.builtin.debug:
-        msg: "Top-level keys: {{ hassio_info.json.keys() | list }}"
-
-    - name: Show hassio backups info - data keys
-      ansible.builtin.debug:
-        msg: "Data keys: {{ hassio_info.json.data.keys() | list }}"
-      when: hassio_info.json.data is defined and hassio_info.json.data is mapping
-
-    - name: Show hassio backups info - backup count and first entry
-      ansible.builtin.debug:
-        msg: |
-          Backup count: {{ hassio_info.json.data.backups | length }}
-          {% if hassio_info.json.data.backups | length > 0 %}
-          First backup: {{ hassio_info.json.data.backups[0] | to_nice_json }}
-          {% endif %}
-      when: hassio_info.json.data is defined and hassio_info.json.data.backups is defined
-
-    - name: Show full raw response (first 2000 chars)
-      ansible.builtin.debug:
-        msg: "{{ hassio_info.content[:2000] }}"
+        msg: "{{ backups_from_attr.content[:2000] }}"
